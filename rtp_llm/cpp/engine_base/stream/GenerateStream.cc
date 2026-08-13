@@ -476,22 +476,39 @@ int64_t GenerateStream::getTimeoutMs() const {
     return generate_input_->generate_config->timeout_ms;
 }
 
-void GenerateStream::checkTimeout() {
+bool GenerateStream::exceededTimeout(std::string& error_msg) const {
     auto running_time_ms = (autil::TimeUtility::currentTimeInMicroSeconds() - begin_time_us_) / 1000;
     auto timeout_ms      = getTimeoutMs();
-    if (timeout_ms > 0 && timeout_ms < running_time_ms) {
-        reportEvent(StreamEvents::Error,
-                    ErrorCode::GENERATE_TIMEOUT,
-                    "query has been running " + std::to_string(running_time_ms) + " ms, "
-                        + "timeout_ms = " + std::to_string(timeout_ms) + ", it's timeout");
+    if (timeout_ms <= 0 || timeout_ms >= running_time_ms) {
+        return false;
+    }
+    error_msg = "query has been running " + std::to_string(running_time_ms) + " ms, "
+                + "timeout_ms = " + std::to_string(timeout_ms) + ", it's timeout";
+    return true;
+}
+
+void GenerateStream::checkTimeout() {
+    std::string error_msg;
+    if (exceededTimeout(error_msg)) {
+        reportEvent(StreamEvents::Error, ErrorCode::GENERATE_TIMEOUT, error_msg);
+    }
+}
+
+void GenerateStream::checkTimeoutWithoutLock() {
+    std::string error_msg;
+    if (exceededTimeout(error_msg)) {
+        reportEventWithoutLock(StreamEvents::Error, ErrorCode::GENERATE_TIMEOUT, error_msg);
     }
 }
 
 // 统一的事件上报接口，替代原先所有 reportXX 方法。
 // 外部线程调用时自动加锁保护 error_info 和 events_ 的一致性。
+// 事件可能让 hasError()/getStatus() 发生变化，而这两者是 nextOutput() 等待谓词的一部分，
+// 因此必须在持锁状态下通知 cv_，否则等待方会漏掉唤醒。
 void GenerateStream::reportEvent(StreamEvents::EventType event, ErrorCode error_code, const std::string& error_msg) {
     std::lock_guard<std::mutex> lock(*mutex_);
     generate_status_->reportEvent(event, error_code, error_msg);
+    cv_->notify_all();
 }
 
 // 无锁版本，供已持有 mutex_ 的内部调用路径使用（如 update/specUpdate/moveToNext 链路）。
@@ -499,11 +516,13 @@ void GenerateStream::reportEventWithoutLock(StreamEvents::EventType event,
                                             ErrorCode               error_code,
                                             const std::string&      error_msg) {
     generate_status_->reportEvent(event, error_code, error_msg);
+    cv_->notify_all();
 }
 
 void GenerateStream::reportError(ErrorCode error_code, const std::string& error_msg) {
     std::lock_guard<std::mutex> lock(*mutex_);
     generate_status_->reportEvent(StreamEvents::Error, error_code, error_msg);
+    cv_->notify_all();
 }
 
 bool GenerateStream::hasEvent(StreamEvents::EventType event) const {
@@ -533,9 +552,10 @@ StreamState GenerateStream::moveToNext() {
     std::lock_guard<std::mutex> lock(*mutex_);
     StreamState                 state = generate_status_->moveToNext();
 
-    // notify one thread waiting for stream completion
+    // cv_ 被多个不同谓词的等待方共用（输出等待、PD-sep 的 NeedRemoteGenerate），
+    // 用 notify_one 可能唤醒谓词不满足的那一个并吞掉信号，必须 notify_all。
     if (getStatus() == StreamState::FINISHED) {
-        cv_->notify_one();
+        cv_->notify_all();
     }
     return state;
 }

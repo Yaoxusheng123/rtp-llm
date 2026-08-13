@@ -223,6 +223,8 @@ public:
 
     int64_t getTimeoutMs() const;
     void    checkTimeout();
+    // 供已持有 mutex_ 的调用方使用，避免 checkTimeout -> reportEvent 重复加锁导致死锁。
+    void checkTimeoutWithoutLock();
 
     void reportEvent(StreamEvents::EventType event,
                      ErrorCode               error_code = ErrorCode::NONE_ERROR,
@@ -533,6 +535,8 @@ protected:
 
     void reportStreamMetrics();
     void reportCacheReuseMetrics() const;
+
+    bool exceededTimeout(std::string& error_msg) const;
 
 protected:
     uint64_t                              stream_magic_ = STREAM_MAGIC;
