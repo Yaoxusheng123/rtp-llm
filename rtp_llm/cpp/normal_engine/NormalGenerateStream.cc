@@ -1,12 +1,32 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
 namespace rtp_llm {
 
+namespace {
+// 唤醒由 cv_ 的 notify 保证，这个时间片只决定 timeout_ms 的检查粒度。
+constexpr int64_t OUTPUT_WAIT_SLICE_MS = 100;
+}  // namespace
+
 ErrorResult<GenerateOutputs> NormalGenerateStream::nextOutput() {
-    // TODO(xinfei.sxf) 某些case下会出现1s的等待
-    while ((!hasError()) && getStatus() != StreamState::FINISHED && generate_outputs_queue_.isEmpty()) {
-        checkTimeout();
-        generate_outputs_queue_.waitNotEmpty();
+    // 谓词横跨三个条件：hasError()/getStatus() 由 mutex_ 保护并经 cv_ 通知，队列非空
+    // 由队列自身的锁保护。必须统一在 mutex_ 上等待，否则谓词与睡眠不原子，通知会丢。
+    // 不能用 autil 队列的 waitNotEmpty()：它拿锁后无条件 wait(1s)，且调用方的 isEmpty()
+    // 与它是两次独立加锁，signal 落在两者之间即丢失，等待方要睡满 1 秒才恢复。
+    {
+        std::unique_lock<std::mutex> lock(*mutex_);
+        auto                         ready = [this] {
+            return hasError() || getStatus() == StreamState::FINISHED || !generate_outputs_queue_.isEmpty();
+        };
+        while (!ready()) {
+            // 这里的超时只用于推进 timeout_ms 判定，唤醒本身由 cv_ 的 notify 保证。
+            if (!cv_->wait_for(lock, std::chrono::milliseconds(OUTPUT_WAIT_SLICE_MS), ready)) {
+                checkTimeoutWithoutLock();
+            }
+        }
     }
     if (hasError()) {
         return statusInfo();
@@ -151,6 +171,8 @@ void NormalGenerateStream::enqueueGenerateOutput(GenerateOutputs&& generate_resu
         reportEventWithoutLock(StreamEvents::Error, ErrorCode::OUTPUT_QUEUE_FULL, "output queue is full");
     } else {
         generate_outputs_queue_.push(std::move(generate_results));
+        // 调用链（update/specUpdate -> updateOutput）全程持有 mutex_，因此这里的通知不会丢。
+        cv_->notify_all();
     }
 }
 
