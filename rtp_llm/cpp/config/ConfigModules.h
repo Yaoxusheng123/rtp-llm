@@ -332,8 +332,15 @@ struct BatchDecodeSchedulerConfig {
 };
 
 struct FIFOSchedulerConfig {
-    int64_t     max_context_batch_size = 1;
-    int64_t     max_batch_tokens_size  = 0;
+    int64_t max_context_batch_size = 1;
+    int64_t max_batch_tokens_size  = 0;
+    // Allow a scheduling round to add context streams to an already-decoding batch. Requires the
+    // model path to accept a mixed prefill+decode batch.
+    bool enable_mixed_batch = false;
+    // Token budget for the context part of a mixed batch. Those tokens are extra work on top of
+    // every decode step, so they get a tighter budget than max_batch_tokens_size. 0 means reuse
+    // max_batch_tokens_size.
+    int64_t     mixed_batch_max_prefill_tokens = 0;
     std::string to_string() const;
 };
 

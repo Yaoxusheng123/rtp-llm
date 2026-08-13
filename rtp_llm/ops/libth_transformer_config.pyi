@@ -493,8 +493,10 @@ class EplbMode:
 
 
 class FIFOSchedulerConfig:
+    enable_mixed_batch: bool
     max_batch_tokens_size: int
     max_context_batch_size: int
+    mixed_batch_max_prefill_tokens: int
 
     def __getstate__(self) -> tuple:
         ...

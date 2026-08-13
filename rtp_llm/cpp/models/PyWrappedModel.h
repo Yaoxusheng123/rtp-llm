@@ -39,6 +39,7 @@ public:
 
     GptModelOutputs forward(const GptModelInputs& inputs) override;
     GptModelOutputs forwardMicroBatched(const GptModelInputs& inputs);
+    GptModelOutputs forwardMixedBatch(const GptModelInputs& inputs);
     void            releaseBuffers() override;
 
 private:
@@ -71,6 +72,13 @@ private:
          splitInputsIntoMicroBatches(const GptModelInputs& inputs, const MicroBatchPlan& micro_batch_plan);
     void holdInputsHostBuffers(const GptModelInputs& inputs);
 
+    // Mixed prefill+decode batch support: splits the batch along the [decode | context] boundary
+    // into two sub-batches that are each shaped exactly like a homogeneous batch, so every kernel
+    // stays on its existing code path.
+    std::pair<GptModelInputs, GptModelInputs> splitMixedBatchInputs(const GptModelInputs& inputs) const;
+    torch_ext::PyModelInputs                  buildSubBatchModelInputs(const GptModelInputs& sub_inputs);
+    torch::Tensor                             runPyModelSubBatch(torch_ext::PyModelInputs& py_model_inputs);
+
     // Member variables (formerly inherited from GptModel)
     const rtp_llm::ExecProperties            device_props_;
     const rtp_llm::MlaOpsType                mla_ops_type_;
@@ -84,7 +92,9 @@ private:
 
     GraphBase* graph_runner_{nullptr};
     py::object py_model_;
-    py::object held_attn_pyobj_;
+    // FMHA impl objects owned by the current forward; they keep the params/workspace tensors the
+    // launched kernels still reference alive until releaseBuffers(). A mixed batch holds two.
+    std::vector<py::object> held_attn_pyobjs_;
     bool       enable_cuda_graph_{false};
     bool       is_prefill_cuda_graph_mode_{false};
     bool       use_spec_decoding_{false};

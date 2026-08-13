@@ -18,6 +18,9 @@ namespace rtp_llm {
 //     plus 1 padding_offset) plus `group_count` per-group block-id copies.
 //     With the current planMicroBatches cap of 2 micro-batches and a hybrid
 //     KV-cache group_count of 4 that's (6 + 4) * 2 = 20 contiguous copies.
+//   * PyWrappedModel.cc::forwardMixedBatch has the same shape: it accumulates
+//     one decode plus one context sub-batch (~7 contiguous copies each, adding
+//     combo_tokens on top of the above) before a single flush.
 //
 // 64 entries gives ~3x headroom over today's worst case (20 contiguous, 5
 // strided) and accommodates ~30 KV-cache groups before hitting the cap. Each

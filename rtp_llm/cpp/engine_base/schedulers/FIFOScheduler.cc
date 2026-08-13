@@ -26,11 +26,18 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
     max_seq_len_(model_config.max_seq_len),
     max_batch_tokens_size_(runtime_config.fifo_scheduler_config.max_batch_tokens_size),
     max_generate_batch_size_(runtime_config.max_generate_batch_size),
+    enable_mixed_batch_(runtime_config.fifo_scheduler_config.enable_mixed_batch),
     need_fill_fake_stream_(parallelism_config.dp_size > 1 && parallelism_config.tp_rank == 0),
     metrics_reporter_(metrics_reporter) {
-    RTP_LLM_LOG_INFO("max_generate_batch_size is [%d], max_batch_tokens_size is [%d]",
-                     max_generate_batch_size_,
-                     max_batch_tokens_size_);
+    const auto mixed_prefill_tokens = runtime_config.fifo_scheduler_config.mixed_batch_max_prefill_tokens;
+    mixed_batch_max_prefill_tokens_ = mixed_prefill_tokens > 0 ? mixed_prefill_tokens : max_batch_tokens_size_;
+    RTP_LLM_LOG_INFO(
+        "max_generate_batch_size is [%d], max_batch_tokens_size is [%d], enable_mixed_batch is [%d], "
+        "mixed_batch_max_prefill_tokens is [%d]",
+        max_generate_batch_size_,
+        max_batch_tokens_size_,
+        enable_mixed_batch_,
+        mixed_batch_max_prefill_tokens_);
 }
 
 FIFOScheduler::~FIFOScheduler() {
@@ -125,8 +132,8 @@ bool FIFOScheduler::evaluateRunningMemory(const list<GenerateStreamPtr>& streams
             return true;
         }
     }
-    // prefill and decode not mixed together
-    if (!running_streams_.empty()) {
+    // prefill and decode not mixed together unless mixed batching is enabled
+    if (!running_streams_.empty() && !enable_mixed_batch_) {
         return false;
     }
     if (running_streams_.size() + streams.size() + 1 > max_generate_batch_size_) {
@@ -134,11 +141,17 @@ bool FIFOScheduler::evaluateRunningMemory(const list<GenerateStreamPtr>& streams
     }
 
     int max_token_size = new_stream->contextLength();
-    if (streams.empty() && max_token_size + running_streams_.size() < int(max_seq_len_)) {
-        return true;
-    }
     for (auto& stream : streams) {
         max_token_size = std::max(max_token_size, stream->contextLength());
+    }
+    // 混批时 context 部分是叠加在每个 decode step 上的额外计算，用独立的（更紧的）预算约束，
+    // 避免一批大 prefill 把正在 decode 的请求的 TPOT 拖长。
+    if (!running_streams_.empty()
+        && max_token_size * (int)(streams.size() + 1) > int(mixed_batch_max_prefill_tokens_)) {
+        return false;
+    }
+    if (streams.empty() && max_token_size + running_streams_.size() < int(max_seq_len_)) {
+        return true;
     }
     // 这里的判断是要求当前调度轮所有请求参与计算的 token 数之和小于 max_batch_tokens_size_，loading_cache_streams
     // 这一轮实际不参与计算，不需要计入。

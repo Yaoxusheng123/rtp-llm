@@ -1049,18 +1049,25 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::init<>())
         .def_readwrite("max_context_batch_size", &FIFOSchedulerConfig::max_context_batch_size)
         .def_readwrite("max_batch_tokens_size", &FIFOSchedulerConfig::max_batch_tokens_size)
+        .def_readwrite("enable_mixed_batch", &FIFOSchedulerConfig::enable_mixed_batch)
+        .def_readwrite("mixed_batch_max_prefill_tokens", &FIFOSchedulerConfig::mixed_batch_max_prefill_tokens)
         .def("to_string", &FIFOSchedulerConfig::to_string)
         .def(py::pickle(
             [](const FIFOSchedulerConfig& self) {
-                return py::make_tuple(self.max_context_batch_size, self.max_batch_tokens_size);
+                return py::make_tuple(self.max_context_batch_size,
+                                      self.max_batch_tokens_size,
+                                      self.enable_mixed_batch,
+                                      self.mixed_batch_max_prefill_tokens);
             },
             [](py::tuple t) {
-                if (t.size() != 2)
+                if (t.size() != 4)
                     throw std::runtime_error("Invalid state!");
                 FIFOSchedulerConfig c;
                 try {
-                    c.max_context_batch_size = t[0].cast<int64_t>();
-                    c.max_batch_tokens_size  = t[1].cast<int64_t>();
+                    c.max_context_batch_size         = t[0].cast<int64_t>();
+                    c.max_batch_tokens_size          = t[1].cast<int64_t>();
+                    c.enable_mixed_batch             = t[2].cast<bool>();
+                    c.mixed_batch_max_prefill_tokens = t[3].cast<int64_t>();
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("FIFOSchedulerConfig unpickle error: ") + e.what());
                 }
