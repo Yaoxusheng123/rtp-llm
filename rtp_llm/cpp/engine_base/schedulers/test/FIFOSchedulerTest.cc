@@ -798,4 +798,108 @@ TEST_F(FIFOSchedulerTest, testTwoForceBatchGroupsIsolation) {
     ASSERT_EQ(scheduler.runningStreamsSize(), 2);
 }
 
+namespace {
+
+struct MixedBatchTestEnv {
+    std::shared_ptr<KVCacheManager> cache_manager;
+    ResourceContext                 resource_context;
+    ModelConfig                     model_config;
+    RuntimeConfig                   runtime_config;
+    PDSepConfig                     pd_sep_config;
+    ParallelismConfig               parallelism_config;
+    ModelSpecificConfig             model_specific_config;
+    std::unique_ptr<FIFOScheduler>  scheduler;
+
+    MixedBatchTestEnv(bool enable_mixed_batch, int mixed_batch_max_prefill_tokens) {
+        CacheConfig cache_config = DeviceTestBase::makeMhaCacheConfig(1, 21, 1, 4, 8, rtp_llm::DataType::TYPE_FP16);
+        cache_manager            = std::make_shared<KVCacheManager>(cache_config);
+        EXPECT_TRUE(cache_manager->init());
+        resource_context.cache_manager = cache_manager;
+
+        model_config.max_seq_len                                            = 100;
+        runtime_config.max_generate_batch_size                              = 100;
+        runtime_config.fifo_scheduler_config.max_batch_tokens_size          = 100;
+        runtime_config.fifo_scheduler_config.enable_mixed_batch             = enable_mixed_batch;
+        runtime_config.fifo_scheduler_config.mixed_batch_max_prefill_tokens = mixed_batch_max_prefill_tokens;
+        scheduler                                                          = std::make_unique<FIFOScheduler>(
+            runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
+    }
+
+    shared_ptr<GenerateStream> makeStream(std::vector<int32_t> input_ids) {
+        std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
+        query->input_ids       = torch::tensor(input_ids, torch::kInt32);
+        query->generate_config = make_shared<GenerateConfig>();
+        return make_shared<NormalGenerateStream>(query, model_config, runtime_config, resource_context, nullptr);
+    }
+};
+
+}  // namespace
+
+// Without mixed batching a newly arrived stream cannot join a batch that already has running
+// streams, so it waits for the whole running cohort to finish. This is the convoy delay that
+// dominates queueing time under load.
+TEST_F(FIFOSchedulerTest, testMixedBatchDisabledKeepsContextWaiting) {
+    MixedBatchTestEnv env(/*enable_mixed_batch=*/false, /*mixed_batch_max_prefill_tokens=*/0);
+
+    auto stream1 = env.makeStream({1, 2, 3, 4, 5});
+    ASSERT_TRUE(env.scheduler->enqueue(stream1).ok());
+    ASSERT_TRUE(env.scheduler->schedule().ok());
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 1);
+
+    auto stream2 = env.makeStream({6, 7, 8, 9, 10});
+    ASSERT_TRUE(env.scheduler->enqueue(stream2).ok());
+    ASSERT_TRUE(env.scheduler->schedule().ok());
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 1);
+    ASSERT_EQ(env.scheduler->waitingStreamsSize(), 1);
+
+    // The convoy has to drain before the newcomer starts.
+    stream1->reportEvent(StreamEvents::GenerateDone);
+    ASSERT_TRUE(env.scheduler->schedule().ok());
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 1);
+    ASSERT_EQ(env.scheduler->waitingStreamsSize(), 0);
+}
+
+// With mixed batching the newcomer is admitted into the same round as the running streams, so its
+// prefill no longer waits for them to finish.
+TEST_F(FIFOSchedulerTest, testMixedBatchAdmitsContextWhileRunning) {
+    MixedBatchTestEnv env(/*enable_mixed_batch=*/true, /*mixed_batch_max_prefill_tokens=*/0);
+
+    auto stream1 = env.makeStream({1, 2, 3, 4, 5});
+    ASSERT_TRUE(env.scheduler->enqueue(stream1).ok());
+    ASSERT_TRUE(env.scheduler->schedule().ok());
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 1);
+
+    auto stream2 = env.makeStream({6, 7, 8, 9, 10});
+    ASSERT_TRUE(env.scheduler->enqueue(stream2).ok());
+    auto status = env.scheduler->schedule();
+    ASSERT_TRUE(status.ok());
+    ASSERT_EQ(status.value().size(), 2);
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 2);
+    ASSERT_EQ(env.scheduler->waitingStreamsSize(), 0);
+}
+
+// mixed_batch_max_prefill_tokens caps how much context work may ride along with a decoding batch,
+// which bounds the TPOT hit those decodes take. The cap only applies to mixed rounds: the same
+// stream is admitted immediately when nothing is running.
+TEST_F(FIFOSchedulerTest, testMixedBatchPrefillTokenBudget) {
+    MixedBatchTestEnv env(/*enable_mixed_batch=*/true, /*mixed_batch_max_prefill_tokens=*/4);
+
+    auto stream1 = env.makeStream({1, 2, 3, 4, 5});
+    ASSERT_TRUE(env.scheduler->enqueue(stream1).ok());
+    ASSERT_TRUE(env.scheduler->schedule().ok());
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 1);
+
+    // contextLength 5 exceeds the 4 token mixed budget, so this round stays decode-only.
+    auto stream2 = env.makeStream({6, 7, 8, 9, 10});
+    ASSERT_TRUE(env.scheduler->enqueue(stream2).ok());
+    ASSERT_TRUE(env.scheduler->schedule().ok());
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 1);
+    ASSERT_EQ(env.scheduler->waitingStreamsSize(), 1);
+
+    stream1->reportEvent(StreamEvents::GenerateDone);
+    ASSERT_TRUE(env.scheduler->schedule().ok());
+    ASSERT_EQ(env.scheduler->runningStreamsSize(), 1);
+    ASSERT_EQ(env.scheduler->waitingStreamsSize(), 0);
+}
+
 }  // namespace rtp_llm

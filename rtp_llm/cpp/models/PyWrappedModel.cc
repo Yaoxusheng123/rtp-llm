@@ -49,9 +49,9 @@ torch::Tensor PyWrappedModel::tensorHoldHostAndToCuda(const torch::Tensor& tenso
 }
 
 void PyWrappedModel::releaseBuffers() {
-    if (held_attn_pyobj_.ptr()) {
+    if (!held_attn_pyobjs_.empty()) {
         py::gil_scoped_acquire gil;
-        held_attn_pyobj_ = py::object();
+        held_attn_pyobjs_.clear();
     }
     buffer_holder_.release();
 }
@@ -59,7 +59,7 @@ void PyWrappedModel::releaseBuffers() {
 PyWrappedModel::~PyWrappedModel() {
     try {
         py::gil_scoped_acquire gil;
-        held_attn_pyobj_ = py::object();
+        held_attn_pyobjs_.clear();
         // Always release py_model_ since it's always initialized now
         py_model_.release();
         if (graph_runner_ != nullptr) {
@@ -107,18 +107,17 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         decode_batch_size,
         batch_size);
 
-    // Defensive guard: PyWrappedModel currently does not support a mixed prefill+decode batch.
-    // The cu_seqlens slice assignment below assumes input_lengths.cumsum spans only context streams,
-    // but input_lengths actually has shape [decode + context]. When both are non-zero the sizes
-    // mismatch (slice=[context_batch_size] vs cumsum=[batch_size]) and copy_ throws an opaque
-    // PyTorch broadcast error. Failing here gives an actionable message and also catches any
-    // future scheduler regression that lets a mixed batch reach the python model path. Schedulers
-    // that talk to py_model are expected to drain decode before adding context (see
-    // FIFOScheduler::evaluateRunningMemory).
+    // This function only builds metadata for a homogeneous batch: the cu_seqlens slice assignment
+    // below assumes input_lengths.cumsum spans only context streams, but input_lengths actually has
+    // shape [decode + context]. When both are non-zero the sizes mismatch
+    // (slice=[context_batch_size] vs cumsum=[batch_size]) and copy_ throws an opaque PyTorch
+    // broadcast error. Mixed batches are split into two homogeneous sub-batches upstream in
+    // forwardMixedBatch(), so reaching here with both non-zero means a new caller bypassed that
+    // split.
     RTP_LLM_CHECK_WITH_INFO(context_batch_size == 0 || decode_batch_size == 0,
-                            "PyWrappedModel received a mixed prefill+decode batch which is not supported: "
-                            "context_batch_size[%ld] decode_batch_size[%ld]. The scheduler must keep prefill and "
-                            "decode batches separate when load_python_model is enabled.",
+                            "buildPyAttentionInputs received a mixed prefill+decode batch: "
+                            "context_batch_size[%ld] decode_batch_size[%ld]. Mixed batches must go through "
+                            "PyWrappedModel::forwardMixedBatch, which splits them per phase.",
                             context_batch_size,
                             decode_batch_size);
 
@@ -402,6 +401,183 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
     return callForwardPostLayers(hidden_states, inputs, false);
 }
 
+// Slices the per-stream batch dimension of a host-side model input.
+//
+// A narrow along the outermost dimension stays contiguous and keeps the pinned storage of the
+// original tensor. The [group, batch, kernel_blocks] block tables are narrowed on the middle
+// dimension instead, so they have to be materialized, and re-pinned because
+// setupKVCacheForAttentionInputs() turns them into async H2D copies that require pinned source
+// memory.
+static torch::Tensor sliceStreamRows(const torch::Tensor& tensor, int64_t offset, int64_t size) {
+    if (!tensor.defined()) {
+        return torch::Tensor();
+    }
+    if (tensor.dim() == 3) {
+        auto sliced = tensor.narrow(1, offset, size);
+        return sliced.is_contiguous() ? sliced : sliced.contiguous().pin_memory();
+    }
+    return tensor.narrow(0, offset, size);
+}
+
+std::pair<GptModelInputs, GptModelInputs> PyWrappedModel::splitMixedBatchInputs(const GptModelInputs& inputs) const {
+    const int64_t decode_batch_size  = inputs.sequence_lengths.size(0);
+    const int64_t context_batch_size = inputs.input_lengths.size(0) - decode_batch_size;
+    const int64_t total_tokens       = inputs.combo_tokens.size(0);
+    // Decode streams contribute exactly one token each and are gathered first; see
+    // NormalModelInputGatherer::processDecodeStreams.
+    const int64_t decode_tokens  = decode_batch_size;
+    const int64_t context_tokens = total_tokens - decode_tokens;
+    RTP_LLM_CHECK_WITH_INFO(context_tokens > 0,
+                            "mixed batch token layout check failed: total_tokens[%ld] decode_batch_size[%ld] "
+                            "context_batch_size[%ld]",
+                            total_tokens,
+                            decode_batch_size,
+                            context_batch_size);
+
+    const auto  empty_i32 = torch::empty({0}, torch::TensorOptions(torch::kInt32).device(torch::kCPU));
+    const auto& block_id  = inputs.kv_cache_block_id;
+    const auto& kernel_id = inputs.kv_cache_kernel_block_id;
+
+    GptModelInputs decode_inputs  = inputs;
+    GptModelInputs context_inputs = inputs;
+
+    decode_inputs.combo_tokens             = inputs.combo_tokens.narrow(0, 0, decode_tokens);
+    decode_inputs.input_lengths            = inputs.input_lengths.narrow(0, 0, decode_batch_size);
+    decode_inputs.prefix_lengths           = empty_i32;
+    decode_inputs.kv_cache_block_id        = sliceStreamRows(block_id, 0, decode_batch_size);
+    decode_inputs.kv_cache_kernel_block_id = sliceStreamRows(kernel_id, 0, decode_batch_size);
+
+    context_inputs.combo_tokens             = inputs.combo_tokens.narrow(0, decode_tokens, context_tokens);
+    context_inputs.input_lengths            = inputs.input_lengths.narrow(0, decode_batch_size, context_batch_size);
+    context_inputs.sequence_lengths         = empty_i32;
+    context_inputs.kv_cache_block_id        = sliceStreamRows(block_id, decode_batch_size, context_batch_size);
+    context_inputs.kv_cache_kernel_block_id = sliceStreamRows(kernel_id, decode_batch_size, context_batch_size);
+
+    // prefix_lengths / request_id / request_pd_separation / cache_keys are already indexed relative
+    // to the context batch, so the context sub-batch inherits them unchanged.
+
+    if (inputs.combo_position_ids.defined()) {
+        // Position ids are per token, with mm_position_ids_style deciding how many ints per token.
+        const int64_t factor       = inputs.combo_position_ids.numel() / total_tokens;
+        const int64_t decode_width = decode_tokens * factor;
+        decode_inputs.combo_position_ids  = inputs.combo_position_ids.narrow(0, 0, decode_width);
+        context_inputs.combo_position_ids = inputs.combo_position_ids.narrow(0, decode_width, context_tokens * factor);
+    }
+    if (inputs.combo_tokens_type_ids.defined()) {
+        decode_inputs.combo_tokens_type_ids  = inputs.combo_tokens_type_ids.narrow(0, 0, decode_tokens);
+        context_inputs.combo_tokens_type_ids = inputs.combo_tokens_type_ids.narrow(0, decode_tokens, context_tokens);
+    }
+    if (inputs.attention_mask.defined()) {
+        decode_inputs.attention_mask  = inputs.attention_mask.narrow(0, 0, decode_batch_size);
+        context_inputs.attention_mask = inputs.attention_mask.narrow(0, decode_batch_size, context_batch_size);
+    }
+
+    // lm_output_indexes / lm_output_lengths are deliberately left whole: the post layers run once on
+    // the merged hidden states, and the gatherer already wrote those indexes against the full
+    // [decode | context] token layout that the merge reproduces.
+
+    return {decode_inputs, context_inputs};
+}
+
+torch_ext::PyModelInputs PyWrappedModel::buildSubBatchModelInputs(const GptModelInputs& sub_inputs) {
+    auto attention_inputs      = buildPyAttentionInputs(sub_inputs);
+    auto bert_embedding_inputs = buildBertEmbeddingInputs(sub_inputs);
+    setupKVCacheForAttentionInputs(attention_inputs, sub_inputs);
+    calculatePaddingOffset(attention_inputs);
+    attention_inputs.padding_offset = tensorHoldHostAndToCuda(attention_inputs.padding_offset);
+    auto token_ids                  = tensorHoldHostAndToCuda(sub_inputs.combo_tokens);
+    return torch_ext::PyModelInputs({token_ids, torch::empty({0}), attention_inputs, bert_embedding_inputs});
+}
+
+// Runs one homogeneous sub-batch. The returned tensor may alias a CUDA graph output buffer, so the
+// caller must consume it before issuing the next sub-batch.
+torch::Tensor PyWrappedModel::runPyModelSubBatch(torch_ext::PyModelInputs& py_model_inputs) {
+    CudaGraphState graph_state;
+    if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
+        py::gil_scoped_acquire gil;
+        RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
+        DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
+        RTP_LLM_LOG_DEBUG("[PyWrappedModel] sub-batch CUDA graph forward, is_prefill=%d, graph_bs=%d",
+                          py_model_inputs.attention_inputs.is_prefill,
+                          graph_state.current_real_graph_bs);
+        py_model_inputs.attention_inputs.is_s_padded = true;
+        return graph_runner_->forward(py_model_inputs, graph_state).hidden_states;
+    }
+    py::gil_scoped_acquire gil;
+    RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
+    DevicePerfWrapper wrapper(enable_device_perf_, "normal forward");
+    RTP_LLM_LOG_DEBUG("[PyWrappedModel] sub-batch normal forward, is_prefill=%d",
+                      py_model_inputs.attention_inputs.is_prefill);
+    auto attn_pyobj = py_model_.attr("prepare_fmha_impl")(py_model_inputs, false);
+    held_attn_pyobjs_.push_back(attn_pyobj);
+    auto outputs = py_model_.attr("forward")(py_model_inputs, attn_pyobj);
+    return outputs.cast<PyModelOutputs>().hidden_states;
+}
+
+// Runs a batch that contains both decode and context streams.
+//
+// The python model path picks a single attention implementation per batch from
+// PyAttentionInputs::is_prefill, so a single fused pass would require every FMHA backend to handle
+// both phases at once. Instead the batch is split along the [decode | context] boundary into two
+// sub-batches, each shaped exactly like the homogeneous batch the engine produces today, and run
+// back to back. Every kernel therefore stays on its existing, already-validated code path; the cost
+// is one extra pass over the layer weights per step.
+//
+// The point of mixing is scheduling, not kernel efficiency: a decoding batch no longer blocks new
+// requests from entering (see FIFOScheduler::evaluateRunningMemory), which removes the convoy delay
+// where an arrival waits for the whole running cohort to finish.
+GptModelOutputs PyWrappedModel::forwardMixedBatch(const GptModelInputs& inputs) {
+    RTP_LLM_PROFILE_SCOPE("py_model.forwardMixedBatch");
+
+    RTP_LLM_CHECK_WITH_INFO(!inputs.is_target_verify && !use_spec_decoding_ && !inputs.last_hidden_states.defined(),
+                            "mixed prefill+decode batch is not supported with speculative decoding, "
+                            "set enable_mixed_batch=false");
+    RTP_LLM_CHECK_WITH_INFO(!device_props_.enable_prefill_cp,
+                            "mixed prefill+decode batch is not supported with prefill context parallel, "
+                            "set enable_mixed_batch=false");
+    RTP_LLM_CHECK_WITH_INFO(!inputs.multimodal_features.has_value() && !inputs.input_embeddings.has_value(),
+                            "mixed prefill+decode batch is not supported for multimodal inputs, because the "
+                            "feature locations index the whole combo, set enable_mixed_batch=false");
+
+    auto [decode_inputs, context_inputs] = splitMixedBatchInputs(inputs);
+
+    // Both sub-batches' host->device copies are accumulated and flushed as one kernel, mirroring
+    // forwardMicroBatched. See the sizing rationale in fuse_copy_util.h.
+    auto decode_model_inputs  = buildSubBatchModelInputs(decode_inputs);
+    auto context_model_inputs = buildSubBatchModelInputs(context_inputs);
+    if (!inputs.warmup && inputs.pd_separation) {
+        // Only context streams write to the remote cache store, and prepareWriteCacheParams derives
+        // the batch sizes from the sub-batch it is given.
+        context_model_inputs.attention_inputs.cache_store_inputs = prepareWriteCacheParams(context_inputs);
+        cache_store_async_writer_->init();
+    }
+    fusedCopy(d2d_copies_);
+
+    const int64_t total_tokens  = inputs.combo_tokens.size(0);
+    const int64_t decode_tokens = decode_inputs.combo_tokens.size(0);
+
+    torch::Tensor decode_hidden = runPyModelSubBatch(decode_model_inputs);
+    RTP_LLM_CHECK_WITH_INFO(decode_hidden.size(0) == decode_tokens,
+                            "decode sub-batch returned %ld rows, expected %ld",
+                            decode_hidden.size(0),
+                            decode_tokens);
+    auto hidden_states = torch::empty({total_tokens, decode_hidden.size(1)}, decode_hidden.options());
+    hidden_states.slice(0, 0, decode_tokens).copy_(decode_hidden);
+
+    torch::Tensor context_hidden = runPyModelSubBatch(context_model_inputs);
+    RTP_LLM_CHECK_WITH_INFO(context_hidden.size(0) == total_tokens - decode_tokens,
+                            "context sub-batch returned %ld rows, expected %ld",
+                            context_hidden.size(0),
+                            total_tokens - decode_tokens);
+    hidden_states.slice(0, decode_tokens, total_tokens).copy_(context_hidden);
+
+    if (!inputs.warmup && inputs.pd_separation) {
+        cache_store_async_writer_->waitAllDone();
+    }
+
+    return callForwardPostLayers(hidden_states, inputs, true);
+}
+
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
     d2d_copies_.clear();
@@ -412,6 +588,14 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     }
     try {
         RTP_LLM_LOG_DEBUG("Calling forward method on Python object instance.");
+
+        const int64_t decode_batch_size  = inputs.sequence_lengths.size(0);
+        const int64_t context_batch_size = inputs.input_lengths.size(0) - decode_batch_size;
+        // Checked before micro-batching: planMicroBatches only splits a mixed batch for single-layer
+        // models, and the sub-batches it produces are themselves mixed.
+        if (decode_batch_size > 0 && context_batch_size > 0) {
+            return forwardMixedBatch(inputs);
+        }
 
         if (int(device_props_.enable_layer_micro_batch)) {
             return forwardMicroBatched(inputs);
@@ -472,9 +656,10 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
                               py_model_inputs.attention_inputs.is_target_verify,
                               py_model_inputs.attention_inputs.is_prefill);
-            held_attn_pyobj_      = py_model_.attr("prepare_fmha_impl")(py_model_inputs, false);
+            auto attn_pyobj = py_model_.attr("prepare_fmha_impl")(py_model_inputs, false);
+            held_attn_pyobjs_.push_back(attn_pyobj);
             auto py_model_forward = py_model_.attr("forward");
-            auto outputs          = py_model_forward(py_model_inputs, held_attn_pyobj_);
+            auto outputs          = py_model_forward(py_model_inputs, attn_pyobj);
             py_model_outputs      = outputs.cast<PyModelOutputs>();
             hidden_states         = py_model_outputs.hidden_states.clone();
         }

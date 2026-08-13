@@ -75,6 +75,10 @@ protected:
     size_t                          max_seq_len_             = 0;
     size_t                          max_batch_tokens_size_   = 0;
     size_t                          max_generate_batch_size_ = 1;
+    // Mixed prefill+decode batching. mixed_batch_max_prefill_tokens_ is resolved in the constructor
+    // and falls back to max_batch_tokens_size_ when left unset.
+    bool                            enable_mixed_batch_      = false;
+    size_t                          mixed_batch_max_prefill_tokens_ = 0;
     const bool                      need_fill_fake_stream_   = false;
     std::atomic<bool>               stop_                    = false;
     bool                            schedule_trigger_        = false;
