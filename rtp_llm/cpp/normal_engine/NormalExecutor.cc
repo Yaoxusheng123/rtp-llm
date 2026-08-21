@@ -90,6 +90,14 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
          kv_cache_layer_to_group,
          cache_manager});
 
+    // Warmup executors are thrown away after memory measurement. Prefill warmup has no
+    // cache manager; decode warmup only has a tiny temporary cache. Capture on the
+    // serving executor after initCacheManager instead.
+    if (warm_up && model_init_params.hw_kernel_config.enable_cuda_graph) {
+        RTP_LLM_LOG_INFO("Disable CUDA graph during warmup; capture on the serving executor");
+        model_init_params.hw_kernel_config.enable_cuda_graph = false;
+    }
+
     if (params.ffn_disaggregate_config.enable_ffn_disaggregate) {
         RTP_LLM_LOG_INFO("using ffn as service");
         enable_ffn_disaggregate_ = true;

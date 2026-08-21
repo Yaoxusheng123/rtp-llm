@@ -182,6 +182,12 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     py_model_                 = py_instance;
     auto py_initialize_method = py_model_.attr("initialize");
     py_init_result            = py_initialize_method(init_resources);
+    // Prefill warmup constructs the executor with cache_manager=nullptr. Decode capture
+    // always reads py_model.kv_cache; capturing here would crash on None.kv_cache_base.
+    if (enable_cuda_graph_ && !params.kv_cache_layer_layout.has_value()) {
+        RTP_LLM_LOG_INFO("Skip CUDA graph capture: KV cache layout is unavailable");
+        enable_cuda_graph_ = false;
+    }
     if (enable_cuda_graph_) {
 #if USING_CUDA || USING_ROCM
         c10::ScalarType dtype = dataTypeToTorchType(description_.data_type);
