@@ -1,5 +1,7 @@
 #include "rtp_llm/cpp/models/logits_processor/MultiSeqLogitsProcessor.h"
 
+#include <limits>
+
 namespace rtp_llm {
 
 std::shared_ptr<MultiSeqLogitsProcessor>
@@ -27,21 +29,34 @@ void MultiSeqLogitsProcessor::process(const SamplerInputs& inputs, size_t start_
         return;
     }
 
-    // mask all logits of the finished sequences except the eos token
-    auto logit_mask_host_tensor = torch::zeros({(int64_t)batch_size, (int64_t)vocab_size}, torch::kUInt8);
-    auto logit_mask_host_ptr    = logit_mask_host_tensor.data_ptr<uint8_t>();
+    // Mask all logits of the finished sequences except the eos token.
+    // Expressed as device-side fills over runs of adjacent finished rows rather than a
+    // [batch_size, vocab_size] host mask: that mask has to reach the device through a pageable
+    // H2D copy, and a pageable H2D implicitly drains the whole CUDA stream.
+    // An out-of-range eos leaves the row fully masked, matching an all-ones mask.
+    const auto neg_inf_logit = -std::numeric_limits<float>::infinity();
+    const bool restore_eos   = eos_token_id_ < vocab_size;
 
-    for (size_t idx = 0; idx < batch_size; ++idx) {
-        if (finished_mask_ptr[idx]) {
-            auto cur_logit_mask_host_ptr = logit_mask_host_ptr + idx * vocab_size;
-            memset(cur_logit_mask_host_ptr, 1, vocab_size * sizeof(uint8_t));
-            cur_logit_mask_host_ptr[eos_token_id_] = 0;
+    for (size_t idx = 0; idx < batch_size;) {
+        if (!finished_mask_ptr[idx]) {
+            ++idx;
+            continue;
         }
+        size_t run_end = idx + 1;
+        while (run_end < batch_size && finished_mask_ptr[run_end]) {
+            ++run_end;
+        }
+
+        auto rows = logits.narrow(0, idx, run_end - idx);
+        if (restore_eos) {
+            auto eos_column = rows.narrow(1, eos_token_id_, 1).clone();
+            rows.fill_(neg_inf_logit);
+            rows.narrow(1, eos_token_id_, 1).copy_(eos_column);
+        } else {
+            rows.fill_(neg_inf_logit);
+        }
+        idx = run_end;
     }
-
-    auto logit_mask = logit_mask_host_tensor.to(torch::kCUDA);
-
-    maskLogits(logits, logit_mask);
 }
 
 void MultiSeqLogitsProcessor::updateMultiSeqStatus(const std::vector<int>& src_batch_indices) {
