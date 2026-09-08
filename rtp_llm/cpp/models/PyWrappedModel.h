@@ -55,6 +55,7 @@ private:
                                           bool                  skip_final_layernorm,
                                           size_t                num_valid_tokens = -1);
     torch::Tensor   tensorHoldHostAndToCuda(const torch::Tensor& tensor);
+    torch::Tensor   lmHeadGemm(const torch::Tensor& last_hidden, const torch::Tensor& lm_head_kernel);
 
     // Methods absorbed from GptModel
     torch::Tensor   tpSyncEmbeddingOrLogits(const torch::Tensor& input);
@@ -106,6 +107,12 @@ private:
 
     // Accumulated H2D copies from tensorHoldHostAndToCuda(); flushed as one kernel per forward.
     FusedD2DCopyParams d2d_copies_;
+
+    // enable_fp32_lm_head keeps the lm_head weight in FP32, which makes the logits GEMM fall back
+    // to an FP32 SIMT kernel instead of tensor cores. lmHeadGemm() runs the GEMM in the activation
+    // dtype through this cached down-cast weight and upcasts only the logits, so the sampler still
+    // gets FP32. Costs one extra vocab x hidden buffer in the activation dtype.
+    torch::Tensor lm_head_gemm_kernel_;
 
     // is_pinned() is expensive on CPU; only assert during first N forwards as a sanity check.
     static constexpr int kPinnedCheckForwardCount = 3;

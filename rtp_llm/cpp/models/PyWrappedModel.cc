@@ -16,6 +16,7 @@
 #include <numeric>
 #include "rtp_llm/cpp/utils/DevicePerfWrapper.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "autil/EnvUtil.h"
 #if USING_CUDA
 #include <c10/cuda/CUDAStream.h>
 #endif
@@ -46,6 +47,27 @@ torch::Tensor PyWrappedModel::tensorHoldHostAndToCuda(const torch::Tensor& tenso
     d2d_copies_.add(tensor.data_ptr(), cuda_tensor.data_ptr(), tensor.nbytes());
 
     return cuda_tensor;
+}
+
+torch::Tensor PyWrappedModel::lmHeadGemm(const torch::Tensor& last_hidden, const torch::Tensor& lm_head_kernel) {
+    // Set LM_HEAD_LOW_PRECISION_GEMM=0 to go back to running the GEMM in the weight dtype.
+    static const bool low_precision_gemm = autil::EnvUtil::getEnv("LM_HEAD_LOW_PRECISION_GEMM", true);
+
+    const auto hidden_type = last_hidden.scalar_type();
+    const bool half_hidden = hidden_type == torch::kBFloat16 || hidden_type == torch::kHalf;
+    if (low_precision_gemm && half_hidden && lm_head_kernel.scalar_type() == torch::kFloat32) {
+        if (!lm_head_gemm_kernel_.defined() || lm_head_gemm_kernel_.scalar_type() != hidden_type) {
+            lm_head_gemm_kernel_ = lm_head_kernel.to(hidden_type);
+            RTP_LLM_LOG_INFO("lm_head gemm runs in %s, cached a down-cast weight of %ld bytes",
+                             c10::toString(hidden_type),
+                             (long)lm_head_gemm_kernel_.nbytes());
+        }
+        // BF16/FP16 tensor core GEMMs accumulate in FP32, so only the weight rounding differs from
+        // an FP32 GEMM. The sampler still receives FP32 logits.
+        return torch::mm(last_hidden, lm_head_gemm_kernel_.t()).to(torch::kFloat32);
+    }
+
+    return torch::mm(last_hidden.to(lm_head_kernel.scalar_type()), lm_head_kernel.t()).to(torch::kFloat32);
 }
 
 void PyWrappedModel::releaseBuffers() {
@@ -804,7 +826,7 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
 
         printTorchTensorData(last_hidden, "last_hidden");
 
-        auto logits = torch::mm(last_hidden.to(lm_head->kernel.dtype()), lm_head->kernel.t()).to(torch::kFloat32);
+        auto logits = lmHeadGemm(last_hidden, lm_head->kernel);
         printTorchTensorData(logits, "logits");
         if (device_props_.tp_size > 1) {
             logits = tpSyncEmbeddingOrLogits(logits);
