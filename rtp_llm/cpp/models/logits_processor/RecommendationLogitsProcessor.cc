@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/models/logits_processor/RecommendationLogitsProcessor.h"
 
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -99,9 +100,15 @@ void RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t 
     }
 
     // 直接在 logits 上按坐标批量写 -inf,按命中数量分摊 H2D 拷贝,体积 O(K) 远小于 O(B*V)。
-    auto rows_t = torch::tensor(rows, torch::kLong).to(logits.device());
-    auto cols_t = torch::tensor(cols, torch::kLong).to(logits.device());
-    logits.index_put_({rows_t, cols_t}, -std::numeric_limits<float>::infinity());
+    // 行列坐标合并成一块 pinned buffer 一次异步搬过去:pageable H2D 是同步的,会把流上已入队的
+    // kernel 全部排空之后才开始拷。
+    static const auto pinned_long = torch::TensorOptions(torch::kLong).pinned_memory(true);
+    auto              indices_h   = torch::empty({2, (int64_t)rows.size()}, pinned_long);
+    auto              indices_ptr = indices_h.data_ptr<int64_t>();
+    std::memcpy(indices_ptr, rows.data(), rows.size() * sizeof(int64_t));
+    std::memcpy(indices_ptr + rows.size(), cols.data(), cols.size() * sizeof(int64_t));
+    auto indices_d = indices_h.to(logits.device(), /*non_blocking=*/true);
+    logits.index_put_({indices_d[0], indices_d[1]}, -std::numeric_limits<float>::infinity());
 }
 
 void RecommendationLogitsProcessor::updateMultiSeqStatus(const std::vector<int>& src_batch_indices) {

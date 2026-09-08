@@ -28,8 +28,10 @@ void MultiSeqLogitsProcessor::process(const SamplerInputs& inputs, size_t start_
     }
 
     // mask all logits of the finished sequences except the eos token
-    auto logit_mask_host_tensor = torch::zeros({(int64_t)batch_size, (int64_t)vocab_size}, torch::kUInt8);
-    auto logit_mask_host_ptr    = logit_mask_host_tensor.data_ptr<uint8_t>();
+    // Pinned so the batch_size x vocab_size H2D below stays async instead of draining the stream.
+    static const auto pinned_u8              = torch::TensorOptions(torch::kUInt8).pinned_memory(true);
+    auto              logit_mask_host_tensor = torch::zeros({(int64_t)batch_size, (int64_t)vocab_size}, pinned_u8);
+    auto              logit_mask_host_ptr    = logit_mask_host_tensor.data_ptr<uint8_t>();
 
     for (size_t idx = 0; idx < batch_size; ++idx) {
         if (finished_mask_ptr[idx]) {
@@ -39,7 +41,7 @@ void MultiSeqLogitsProcessor::process(const SamplerInputs& inputs, size_t start_
         }
     }
 
-    auto logit_mask = logit_mask_host_tensor.to(torch::kCUDA);
+    auto logit_mask = logit_mask_host_tensor.to(torch::kCUDA, /*non_blocking=*/true);
 
     maskLogits(logits, logit_mask);
 }

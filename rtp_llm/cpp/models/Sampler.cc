@@ -45,9 +45,12 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         has_num_beams ? torch::empty({(int64_t)inputs.batch_size_out}, torch::kInt32) : torch::Tensor();
     // Move token_ids to CUDA once so sampleGreedy writes GPU→GPU (no blocking D2H sync).
     // Callers that need CPU access should call .cpu() explicitly.
-    // Use blocking transfer: on ROCm, hipMemcpyAsync from pageable memory is truly async
-    // and can cause memory access faults if a kernel reads the buffer before transfer completes.
-    auto inputs_token_ids_cuda = inputs.token_ids.to(torch::kCUDA);
+    // The input gatherer allocates token_ids in pinned memory, which lets this stay a real async
+    // copy ordered on the sampling stream instead of a pageable copy that drains the whole stream
+    // first. Pageable inputs (tests, other gatherers) keep the blocking transfer: on ROCm,
+    // hipMemcpyAsync from pageable memory is truly async and a kernel could read the buffer
+    // before the transfer lands.
+    auto inputs_token_ids_cuda = inputs.token_ids.to(torch::kCUDA, /*non_blocking=*/inputs.token_ids.is_pinned());
     auto all_token_ids_out     = variable_num_beams ?
                                      torch::empty({(int64_t)inputs.batch_size_out, (int64_t)max_seq_len},
                                               torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA)) :

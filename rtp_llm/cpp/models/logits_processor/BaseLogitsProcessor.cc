@@ -21,8 +21,11 @@ void BaseLogitsProcessor::memFill(const torch::Tensor& new_tokens_logits, size_t
 torch::Tensor BaseLogitsProcessor::generateVocabMask(
     size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids) {
     RTP_LLM_CHECK(batch_candidate_token_ids.size() == batch_size);
-    auto vocab_mask_cpu = torch::ones({(int64_t)batch_size, (int64_t)vocab_size}, torch::kUInt8);
-    auto vocab_mask_ptr = vocab_mask_cpu.data_ptr<uint8_t>();
+    // Pinned so the batch_size x vocab_size H2D below stays async; a pageable copy of this size is
+    // synchronous and drains everything already queued on the sampling stream.
+    static const auto pinned_u8      = torch::TensorOptions(torch::kUInt8).pinned_memory(true);
+    auto              vocab_mask_cpu = torch::ones({(int64_t)batch_size, (int64_t)vocab_size}, pinned_u8);
+    auto              vocab_mask_ptr = vocab_mask_cpu.data_ptr<uint8_t>();
 
     for (size_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
         const auto& candidate_token_ids = batch_candidate_token_ids[batch_idx];
@@ -33,7 +36,7 @@ torch::Tensor BaseLogitsProcessor::generateVocabMask(
         }
     }
 
-    return vocab_mask_cpu.to(torch::kCUDA);
+    return vocab_mask_cpu.to(torch::kCUDA, /*non_blocking=*/true);
 }
 void BaseLogitsProcessor::maskLogits(torch::Tensor& new_tokens_logits, const torch::Tensor& vocab_mask) {
     RTP_LLM_CHECK(new_tokens_logits.dim() == 2);

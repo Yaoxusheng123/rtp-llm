@@ -108,17 +108,22 @@ SamplerInputs NormalSamplerInputGatherer::allocateSamplerInputs(const StreamGrou
     sampler_inputs.step             = stream_groups.maxSeqLen() + propose_step;
     sampler_inputs.batch_size       = total_batch_size_in;
     sampler_inputs.batch_size_out   = total_batch_size_out;
-    auto bs                         = (int64_t)total_batch_size_in;
-    sampler_inputs.sequence_lengths = torch::empty({bs}, torch::kInt32);
-    sampler_inputs.logits_processor_states_ptr.reset();
-    sampler_inputs.input_lengths  = torch::empty({bs}, torch::kInt32);
-    sampler_inputs.num_beams_in   = torch::empty({bs}, torch::kLong);
-    sampler_inputs.num_beams_out  = torch::empty({bs}, torch::kLong);
+
+    auto              bs          = (int64_t)total_batch_size_in;
     static const auto pinned_int  = torch::TensorOptions(torch::kInt).pinned_memory(true);
     static const auto pinned_i32  = torch::TensorOptions(torch::kInt32).pinned_memory(true);
     static const auto pinned_f32  = torch::TensorOptions(torch::kFloat32).pinned_memory(true);
     static const auto pinned_bool = torch::TensorOptions(torch::kBool).pinned_memory(true);
 
+    sampler_inputs.logits_processor_states_ptr.reset();
+
+    // Everything that gets copied to the device must be pinned: a pageable H2D is synchronous, so
+    // it drains the whole stream before it can start. num_beams_in/out and finished_mask stay
+    // pageable because they are only ever read on the host.
+    sampler_inputs.sequence_lengths     = torch::empty({bs}, pinned_i32);
+    sampler_inputs.input_lengths        = torch::empty({bs}, pinned_i32);
+    sampler_inputs.num_beams_in         = torch::empty({bs}, torch::kLong);
+    sampler_inputs.num_beams_out        = torch::empty({bs}, torch::kLong);
     sampler_inputs.top_k                = torch::empty({bs}, pinned_int);
     sampler_inputs.top_p                = torch::empty({bs}, pinned_f32);
     sampler_inputs.temperature          = torch::empty({bs}, pinned_f32);
@@ -129,10 +134,10 @@ SamplerInputs NormalSamplerInputGatherer::allocateSamplerInputs(const StreamGrou
     sampler_inputs.do_sample            = torch::empty({bs}, pinned_bool);
     sampler_inputs.finished_mask        = torch::empty({bs}, torch::kBool);
     if (stream_groups.needReturnCumLogProbs()) {
-        sampler_inputs.cum_log_probs = torch::empty({(int64_t)total_batch_size_in}, torch::kFloat32);
+        sampler_inputs.cum_log_probs = torch::empty({(int64_t)total_batch_size_in}, pinned_f32);
     }
     sampler_inputs.token_ids =
-        torch::empty({(int64_t)total_batch_size_in, (int64_t)(sampler_inputs.step + 1)}, torch::kInt32);
+        torch::empty({(int64_t)total_batch_size_in, (int64_t)(sampler_inputs.step + 1)}, pinned_i32);
     sampler_inputs.generator.resize(total_batch_size_in);
     return sampler_inputs;
 }
