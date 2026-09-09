@@ -297,11 +297,16 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     RTP_LLM_LOG_DEBUG("Replay Start");
     prepareInputs(inputs, state);
     {
-        // Replay is async. Mixed-batch decode graph then immediately allocates and
-        // runs eager prefill. With a private CUDA-graph mempool that interleaves
-        // with the caching allocator and hangs the engine loop. Finish the replay
-        // before returning, and drop the GIL so the sync cannot pin the interpreter.
+        // Capture-time replayAndSyncCheck uses graphDeviceSynchronize(). An event
+        // on the current PyTorch stream is not enough: capture/replay can run on
+        // capture_stream_ against shared_graph_pool_, and mixed-batch then does
+        // torch::empty + eager prefill on the caching allocator. That interleaves
+        // the two pools and hangs the engine loop. Drop the GIL so the device
+        // barrier cannot pin the interpreter.
         py::gil_scoped_release release;
+        // prepareInputs may enqueue copies / fill_ / prepare_cuda_graph on streams
+        // other than the one replay uses. Drain them before launch.
+        cuda_graph::graphDeviceSynchronize();
         if (is_prefill_cuda_graph_mode_) {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayPrefill)");
             replayPrefill(state.current_real_graph_seq_len);
@@ -315,8 +320,12 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
                 graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
                     0, 0, state.seq_len_sum);
         }
+        cuda_graph::graphDeviceSynchronize();
+        // Clone off graph-pool storage before the caller allocates. The slice
+        // aliases capture buffers; returning it lets the next torch::empty race
+        // the private mempool even after the device barrier.
+        outputs.hidden_states = outputs.hidden_states.clone();
         forward_event_.record(cuda_graph::graphGetCurrentStream());
-        forward_event_.synchronize();
     }
     RTP_LLM_LOG_DEBUG("Replay End");
     return outputs;
