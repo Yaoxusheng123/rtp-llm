@@ -515,7 +515,7 @@ torch_ext::PyModelInputs PyWrappedModel::buildSubBatchModelInputs(const GptModel
 // caller must consume it before issuing the next sub-batch.
 torch::Tensor PyWrappedModel::runPyModelSubBatch(torch_ext::PyModelInputs& py_model_inputs) {
     CudaGraphState graph_state;
-    if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
+    if (enable_cuda_graph_ && graph_runner_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
         py::gil_scoped_acquire gil;
         RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
         DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
@@ -658,7 +658,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
 
         // Cast the Python object to PyModelOutputs and extract hidden states
         CudaGraphState graph_state;
-        if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
+        if (enable_cuda_graph_ && graph_runner_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");

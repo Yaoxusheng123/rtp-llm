@@ -176,9 +176,14 @@ class FusedRopeKVCacheDecodeOp:
     def forward(
         self,
         qkv: torch.Tensor,
-        kv_cache: LayerKVCache,
+        kv_cache: Optional[LayerKVCache],
         params: FusedRopeAttnParams,
     ) -> torch.Tensor:
+        if kv_cache is None:
+            raise RuntimeError(
+                "FusedRopeKVCacheDecodeOp requires kv_cache; "
+                "CUDA graph capture without a KV cache is not supported"
+            )
         rope_config = self.attn_configs.rope_config
         rope_cache = get_rope_cache_once(rope_config, self.attn_configs.max_seq_len)
         assert params.kv_cache_offset is not None

@@ -191,79 +191,87 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     py_init_result            = py_initialize_method(init_resources);
     if (enable_cuda_graph_) {
 #if USING_CUDA || USING_ROCM
-        c10::ScalarType dtype = dataTypeToTorchType(description_.data_type);
-
-        // Create GraphParams from individual config fields
-        GraphParams graph_params;
-        graph_params.enable_cuda_graph            = params.hw_kernel_config.enable_cuda_graph;
-        graph_params.enable_cuda_graph_debug_mode = params.hw_kernel_config.enable_cuda_graph_debug_mode;
-        graph_params.is_prefill_cuda_graph_mode   = is_prefill_cuda_graph_mode;
-        graph_params.max_seq_len                  = params.max_seq_len;
-        graph_params.tokens_per_block             = params.tokens_per_block;
-        graph_params.kernel_tokens_per_block      = params.kernel_tokens_per_block;
-        graph_params.hidden_size                  = params.hidden_size;
-        graph_params.model_data_type              = dtype;
-        graph_params.max_context_batch_size       = params.concurrency_config.concurrency_limit;
-        graph_params.prefill_capture_seq_lens     = params.hw_kernel_config.prefill_capture_seq_lens;
-        graph_params.decode_capture_batch_sizes   = params.hw_kernel_config.decode_capture_batch_sizes;
-        graph_params.kv_cache_group_num           = params.kv_cache_group_num;
-
-        if (kv_cache_layer_to_group.size() > 0) {
-            graph_params.kv_cache_layer_to_group = kv_cache_layer_to_group;
+        // Prefill warmup builds NormalExecutor with a null cache_manager to measure
+        // activation memory. Decode RoPE/FMHA graph capture needs real KV tensors, so
+        // skip graph setup here. The real executor created after initCacheManager()
+        // will capture. Do not call initialize() a second time: pybind can present
+        // the moved-from optional as None and wipe the Python kv_cache.
+        if (!init_resources.kv_cache.has_value()) {
+            RTP_LLM_LOG_INFO("Skip CUDA graph capture: kv_cache layout is unavailable "
+                             "(typical during prefill warmup with null cache_manager)");
+            enable_cuda_graph_ = false;
         } else {
-            graph_params.kv_cache_layer_to_group = params.kv_cache_layer_to_group;
-        }
+            c10::ScalarType dtype = dataTypeToTorchType(description_.data_type);
 
-        // clang-format off
-        // Decision table for num_tokens_per_bs:
-        // +---------------------------+--------------------------+----------------+----------+-------------------------+
-        // | Model Type                | is_prefill_cuda_graph    | sp_config.type | model_id | num_tokens_per_bs       |
-        // +---------------------------+--------------------------+----------------+----------+-------------------------+
-        // | Embedding Model (prefill) | true                     | SP_TYPE_NONE   | -        | max_seq_len             |
-        // | Draft Model (prefill)     | true                     | != SP_TYPE_NONE| 1        | gen_num_per_cycle + 1   |
-        // | Normal Model (decode)     | false                    | SP_TYPE_NONE   | -        | 1 (default)             |
-        // | Target Model (verify)     | false                    | != SP_TYPE_NONE| 0        | gen_num_per_cycle + 1   |
-        // | Draft Model (decode)      | false                    | != SP_TYPE_NONE| 1        | 1 (default)             |
-        // +---------------------------+--------------------------+----------------+----------+-------------------------+
-        // clang-format on
+            // Create GraphParams from individual config fields
+            GraphParams graph_params;
+            graph_params.enable_cuda_graph            = params.hw_kernel_config.enable_cuda_graph;
+            graph_params.enable_cuda_graph_debug_mode = params.hw_kernel_config.enable_cuda_graph_debug_mode;
+            graph_params.is_prefill_cuda_graph_mode   = is_prefill_cuda_graph_mode;
+            graph_params.max_seq_len                  = params.max_seq_len;
+            graph_params.tokens_per_block             = params.tokens_per_block;
+            graph_params.kernel_tokens_per_block      = params.kernel_tokens_per_block;
+            graph_params.hidden_size                  = params.hidden_size;
+            graph_params.model_data_type              = dtype;
+            graph_params.max_context_batch_size       = params.concurrency_config.concurrency_limit;
+            graph_params.prefill_capture_seq_lens     = params.hw_kernel_config.prefill_capture_seq_lens;
+            graph_params.decode_capture_batch_sizes   = params.hw_kernel_config.decode_capture_batch_sizes;
+            graph_params.kv_cache_group_num           = params.kv_cache_group_num;
 
-        if (is_prefill_cuda_graph_mode && params.sp_config.type == SP_TYPE_NONE) {
-            // for embedding model
-            graph_params.num_tokens_per_bs = params.max_seq_len;
-        } else if (params.sp_config.type != SP_TYPE_NONE && params.sp_config.gen_num_per_cycle > 0
-                   && (!params.model_id || is_prefill_cuda_graph_mode)) {
-            // for target model verify and draft model prefill
-            graph_params.num_tokens_per_bs = params.sp_config.gen_num_per_cycle + 1;
-        } else {
-            graph_params.num_tokens_per_bs = 1;
-        }
-        graph_params.is_target_verify = use_spec_decoding;
-        if (params.sp_config.type != SP_TYPE_NONE) {
-            graph_params.sp_steps = params.sp_config.gen_num_per_cycle;
-        }
+            if (kv_cache_layer_to_group.size() > 0) {
+                graph_params.kv_cache_layer_to_group = kv_cache_layer_to_group;
+            } else {
+                graph_params.kv_cache_layer_to_group = params.kv_cache_layer_to_group;
+            }
 
-        graph_runner_ = new CudaGraphRunner(graph_params, py_instance);
-        RTP_LLM_CHECK_WITH_INFO(graph_runner_ != nullptr, "graph_runner_ can't be nullptr in PyWrapper");
-        {
-            void* nccl_comm = cuda_graph::getGraphCaptureTpNcclComm();
-            cuda_graph::register_graph_capture_nccl_comm(nccl_comm,
-                                                         static_cast<int>(params.parallelism_config.tp_size),
-                                                         static_cast<int>(params.parallelism_config.tp_rank));
+            // clang-format off
+            // Decision table for num_tokens_per_bs:
+            // +---------------------------+--------------------------+----------------+----------+-------------------------+
+            // | Model Type                | is_prefill_cuda_graph    | sp_config.type | model_id | num_tokens_per_bs       |
+            // +---------------------------+--------------------------+----------------+----------+-------------------------+
+            // | Embedding Model (prefill) | true                     | SP_TYPE_NONE   | -        | max_seq_len             |
+            // | Draft Model (prefill)     | true                     | != SP_TYPE_NONE| 1        | gen_num_per_cycle + 1   |
+            // | Normal Model (decode)     | false                    | SP_TYPE_NONE   | -        | 1 (default)             |
+            // | Target Model (verify)     | false                    | != SP_TYPE_NONE| 0        | gen_num_per_cycle + 1   |
+            // | Draft Model (decode)      | false                    | != SP_TYPE_NONE| 1        | 1 (default)             |
+            // +---------------------------+--------------------------+----------------+----------+-------------------------+
+            // clang-format on
+
+            if (is_prefill_cuda_graph_mode && params.sp_config.type == SP_TYPE_NONE) {
+                // for embedding model
+                graph_params.num_tokens_per_bs = params.max_seq_len;
+            } else if (params.sp_config.type != SP_TYPE_NONE && params.sp_config.gen_num_per_cycle > 0
+                       && (!params.model_id || is_prefill_cuda_graph_mode)) {
+                // for target model verify and draft model prefill
+                graph_params.num_tokens_per_bs = params.sp_config.gen_num_per_cycle + 1;
+            } else {
+                graph_params.num_tokens_per_bs = 1;
+            }
+            graph_params.is_target_verify = use_spec_decoding;
+            if (params.sp_config.type != SP_TYPE_NONE) {
+                graph_params.sp_steps = params.sp_config.gen_num_per_cycle;
+            }
+
+            graph_runner_ = new CudaGraphRunner(graph_params, py_instance);
+            RTP_LLM_CHECK_WITH_INFO(graph_runner_ != nullptr, "graph_runner_ can't be nullptr in PyWrapper");
+            {
+                void* nccl_comm = cuda_graph::getGraphCaptureTpNcclComm();
+                cuda_graph::register_graph_capture_nccl_comm(nccl_comm,
+                                                             static_cast<int>(params.parallelism_config.tp_size),
+                                                             static_cast<int>(params.parallelism_config.tp_rank));
+            }
+            if (weights_.position_encoding) {
+                graph_runner_->setPositionEncoding(weights_.position_encoding->kernel.cuda());
+            }
+            if (weights_.token_type_embedding) {
+                graph_runner_->setTokenTypeEmbedding(weights_.token_type_embedding->kernel.cuda());
+            }
+            graph_runner_->setInputEmbeddingScalar(description_.input_embedding_scalar);
+            graph_runner_->initCapture();
         }
 #else
         RTP_LLM_CHECK_WITH_INFO(false, "CUDA/HIP Graph is only supported on CUDA/ROCm platform");
 #endif
-        if (weights_.position_encoding) {
-            graph_runner_->setPositionEncoding(weights_.position_encoding->kernel.cuda());
-        }
-        if (weights_.token_type_embedding) {
-            graph_runner_->setTokenTypeEmbedding(weights_.token_type_embedding->kernel.cuda());
-        }
-        graph_runner_->setInputEmbeddingScalar(description_.input_embedding_scalar);
-        RTP_LLM_CHECK_WITH_INFO(graph_runner_ != nullptr, "graph_runner_ can't be null");
-        auto py_initialize_method = py_instance.attr("initialize");
-        py_init_result            = py_initialize_method(init_resources);
-        graph_runner_->initCapture();
     }
 
     auto py_init_success = py_init_result.cast<bool>();

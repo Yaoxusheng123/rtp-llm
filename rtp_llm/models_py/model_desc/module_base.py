@@ -52,7 +52,11 @@ class GptModelBase(nn.Module):
         self.params_dict: dict[int, Any] = {}
 
     def initialize(self, init_resource: PyModelInitResources) -> bool:
-        self.kv_cache = init_resource.kv_cache
+        incoming = init_resource.kv_cache
+        if incoming is not None:
+            self.kv_cache = incoming
+        elif self.kv_cache is None:
+            logging.info("GptModelBase.initialize: kv_cache is None")
         if self.kv_cache is not None:
             num_layers = len(self.kv_cache.kv_cache_base_by_layer)
             layer0_shape = (
