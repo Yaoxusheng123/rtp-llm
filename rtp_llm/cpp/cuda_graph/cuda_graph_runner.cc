@@ -246,7 +246,26 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
         }
     }
 
-    // Reset unused batch portions to prevent stale data (prefill only)
+    // Reset unused batch portions to prevent stale data.
+    // Decode graphs are captured at the padded key (e.g. bs=51 replays the 64 graph).
+    // Leftover slots keep capture-time sequence_lengths (~max_seq_len) and block_id=0,
+    // which makes dummy sequences attend the full window on physical block 0.
+    if (!is_prefill_cuda_graph_mode_ && state.current_batch_size < state.current_real_graph_bs) {
+        const int graph_bs = state.current_real_graph_bs;
+        py_model_inputs_.attention_inputs.sequence_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
+        if (py_model_inputs_.attention_inputs.input_lengths.size(0) >= graph_bs) {
+            py_model_inputs_.attention_inputs.input_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
+        }
+        if (py_model_inputs_.attention_inputs.input_lengths_d.defined()
+            && py_model_inputs_.attention_inputs.input_lengths_d.size(0) >= graph_bs) {
+            py_model_inputs_.attention_inputs.input_lengths_d.slice(0, state.current_batch_size, graph_bs).fill_(1);
+        }
+        if (py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.defined()
+            && py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.size(0) >= graph_bs) {
+            py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.slice(0, state.current_batch_size, graph_bs)
+                .fill_(1);
+        }
+    }
     if (is_prefill_cuda_graph_mode_) {
         if (state.current_batch_size < max_bs_) {
             py_model_inputs_.attention_inputs.prefix_lengths.slice(0, state.current_batch_size, max_bs_).fill_(0);
@@ -277,25 +296,28 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     // decode or embedding model only
     RTP_LLM_LOG_DEBUG("Replay Start");
     prepareInputs(inputs, state);
-    if (is_prefill_cuda_graph_mode_) {
-        {
+    {
+        // Replay is async. Mixed-batch decode graph then immediately allocates and
+        // runs eager prefill. With a private CUDA-graph mempool that interleaves
+        // with the caching allocator and hangs the engine loop. Finish the replay
+        // before returning, and drop the GIL so the sync cannot pin the interpreter.
+        py::gil_scoped_release release;
+        if (is_prefill_cuda_graph_mode_) {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayPrefill)");
             replayPrefill(state.current_real_graph_seq_len);
-        }
-        outputs.hidden_states =
-            graph_instances_[state.current_real_graph_seq_len].mem_hold_.decoder_layer_hidden_states_.slice(
-                0, 0, state.current_seq_len);
-    } else {
-        {
+            outputs.hidden_states =
+                graph_instances_[state.current_real_graph_seq_len].mem_hold_.decoder_layer_hidden_states_.slice(
+                    0, 0, state.current_seq_len);
+        } else {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
             replayDecode(state.current_real_graph_bs);
+            outputs.hidden_states =
+                graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
+                    0, 0, state.seq_len_sum);
         }
-        outputs.hidden_states =
-            graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
-                0, 0, state.seq_len_sum);
+        forward_event_.record(cuda_graph::graphGetCurrentStream());
+        forward_event_.synchronize();
     }
-    // record forward done event
-    forward_event_.record(cuda_graph::graphGetCurrentStream());
     RTP_LLM_LOG_DEBUG("Replay End");
     return outputs;
 }

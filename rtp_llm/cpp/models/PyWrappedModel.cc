@@ -511,8 +511,7 @@ torch_ext::PyModelInputs PyWrappedModel::buildSubBatchModelInputs(const GptModel
     return torch_ext::PyModelInputs({token_ids, torch::empty({0}), attention_inputs, bert_embedding_inputs});
 }
 
-// Runs one homogeneous sub-batch. The returned tensor may alias a CUDA graph output buffer, so the
-// caller must consume it before issuing the next sub-batch.
+// Runs one homogeneous sub-batch. Graph outputs are cloned off the capture buffer before return.
 torch::Tensor PyWrappedModel::runPyModelSubBatch(torch_ext::PyModelInputs& py_model_inputs) {
     CudaGraphState graph_state;
     if (enable_cuda_graph_ && graph_runner_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
@@ -523,7 +522,10 @@ torch::Tensor PyWrappedModel::runPyModelSubBatch(torch_ext::PyModelInputs& py_mo
                           py_model_inputs.attention_inputs.is_prefill,
                           graph_state.current_real_graph_bs);
         py_model_inputs.attention_inputs.is_s_padded = true;
-        return graph_runner_->forward(py_model_inputs, graph_state).hidden_states;
+        // Clone off the graph output buffer before the caller allocates or runs eager
+        // prefill. The view aliases graph-pool storage; returning it lets the next
+        // torch::empty / context forward race the private mempool.
+        return graph_runner_->forward(py_model_inputs, graph_state).hidden_states.clone();
     }
     py::gil_scoped_acquire gil;
     RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
