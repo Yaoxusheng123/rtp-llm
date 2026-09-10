@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_runner.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -8,6 +9,25 @@
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 using namespace torch_ext;
 namespace rtp_llm {
+namespace {
+
+// Allocate on the current (default) CUDA caching allocator and copy `src` into it.
+// clone()/empty_like() inherit the source StorageImpl allocator. Graph outputs live
+// in the private CUDA Graph mempool; returning that storage lets a later
+// torch::empty / eager prefill race the same pool and hang the engine loop.
+torch::Tensor copyHiddenStatesOffGraphPool(const torch::Tensor& src) {
+    if (!src.defined()) {
+        return src;
+    }
+    auto opts = torch::TensorOptions().dtype(src.dtype()).device(src.device()).requires_grad(false);
+    auto dst  = torch::empty(src.sizes(), opts);
+    if (src.numel() > 0) {
+        dst.copy_(src);
+    }
+    return dst;
+}
+
+}  // namespace
 
 // clang-format off
 // CUDA Graph Mode Configuration Table:
@@ -283,10 +303,26 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
             .fill_(last_valid_kv);
     }
 
-    // launch prepare_cuda_graph when attention inputs are ready
+    // Optional: some attention impls update kernel params here. GptModelBase
+    // exposes fill_params instead, and many backends bake params in __init__.
+    // A missing method must not throw AttributeError and abort replay.
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs(prepare_cuda_graph)");
-        attn_pyobj.attr("prepare_cuda_graph")(py_model_inputs_.attention_inputs);
+        if (!attn_pyobj.is_none() && py::hasattr(attn_pyobj, "prepare_cuda_graph")) {
+            attn_pyobj.attr("prepare_cuda_graph")(py_model_inputs_.attention_inputs);
+        } else if (py::hasattr(py_instance_, "fill_params") && py::hasattr(py_instance_, "params_dict")) {
+            const int capture_key =
+                is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
+            py::object params_dict = py_instance_.attr("params_dict");
+            if (py::len(params_dict) > 0 && params_dict.contains(py::int_(capture_key))) {
+                py_instance_.attr("fill_params")(py_model_inputs_.attention_inputs.sequence_lengths,
+                                                 py_model_inputs_.attention_inputs.input_lengths,
+                                                 py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
+                                                 state.current_batch_size,
+                                                 capture_key,
+                                                 kernel_seq_size_per_block_);
+            }
+        }
     }
 }
 
@@ -296,6 +332,18 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     // decode or embedding model only
     RTP_LLM_LOG_DEBUG("Replay Start");
     prepareInputs(inputs, state);
+
+    static std::atomic<int> graph_fwd_log_left{16};
+    const bool              log_this = graph_fwd_log_left.fetch_sub(1) > 0;
+    if (log_this) {
+        RTP_LLM_LOG_INFO("CUDA graph replay begin prefill=%d bs=%d seq=%d graph_bs=%d graph_seq=%d",
+                         int(is_prefill_cuda_graph_mode_),
+                         state.current_batch_size,
+                         state.current_seq_len,
+                         state.current_real_graph_bs,
+                         state.current_real_graph_seq_len);
+    }
+
     {
         // Capture-time replayAndSyncCheck uses graphDeviceSynchronize(). An event
         // on the current PyTorch stream is not enough: capture/replay can run on
@@ -321,11 +369,15 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
                     0, 0, state.seq_len_sum);
         }
         cuda_graph::graphDeviceSynchronize();
-        // Clone off graph-pool storage before the caller allocates. The slice
-        // aliases capture buffers; returning it lets the next torch::empty race
-        // the private mempool even after the device barrier.
-        outputs.hidden_states = outputs.hidden_states.clone();
-        forward_event_.record(cuda_graph::graphGetCurrentStream());
+    }
+    // GIL held: copy into a tensor allocated on the default caching allocator.
+    // clone() would keep the graph-pool StorageImpl and leak it into mixed-batch.
+    outputs.hidden_states = copyHiddenStatesOffGraphPool(outputs.hidden_states);
+    forward_event_.record(cuda_graph::graphGetCurrentStream());
+    if (log_this) {
+        RTP_LLM_LOG_INFO("CUDA graph replay copied off graph pool rows=%ld cols=%ld",
+                         long(outputs.hidden_states.size(0)),
+                         outputs.hidden_states.dim() > 1 ? long(outputs.hidden_states.size(1)) : 0L);
     }
     RTP_LLM_LOG_DEBUG("Replay End");
     return outputs;

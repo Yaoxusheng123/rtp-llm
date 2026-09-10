@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 #include "rtp_llm/cpp/utils/utils.h"
 #include "rtp_llm/cpp/model_utils/AttentionConfig.h"
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <mutex>
@@ -24,6 +25,16 @@
 using namespace std;
 
 namespace rtp_llm {
+namespace {
+
+// Allocate on the default CUDA caching allocator. TensorOptions copied from a
+// graph-pool tensor (or empty_like) keep that private mempool id.
+torch::Tensor emptyOnDefaultCudaPool(int64_t rows, int64_t cols, const torch::Tensor& like) {
+    return torch::empty({rows, cols},
+                        torch::TensorOptions().dtype(like.dtype()).device(like.device()).requires_grad(false));
+}
+
+}  // namespace
 
 torch::Tensor PyWrappedModel::tensorHoldHostAndToCuda(const torch::Tensor& tensor) {
     if (tensor.device().is_cuda()) {
@@ -511,7 +522,8 @@ torch_ext::PyModelInputs PyWrappedModel::buildSubBatchModelInputs(const GptModel
     return torch_ext::PyModelInputs({token_ids, torch::empty({0}), attention_inputs, bert_embedding_inputs});
 }
 
-// Runs one homogeneous sub-batch. Graph outputs are cloned off the capture buffer before return.
+// Runs one homogeneous sub-batch. Graph runner already copies outputs off the
+// capture mempool onto the default caching allocator.
 torch::Tensor PyWrappedModel::runPyModelSubBatch(torch_ext::PyModelInputs& py_model_inputs) {
     CudaGraphState graph_state;
     if (enable_cuda_graph_ && graph_runner_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
@@ -522,10 +534,7 @@ torch::Tensor PyWrappedModel::runPyModelSubBatch(torch_ext::PyModelInputs& py_mo
                           py_model_inputs.attention_inputs.is_prefill,
                           graph_state.current_real_graph_bs);
         py_model_inputs.attention_inputs.is_s_padded = true;
-        // Clone off the graph output buffer before the caller allocates or runs eager
-        // prefill. The view aliases graph-pool storage; returning it lets the next
-        // torch::empty / context forward race the private mempool.
-        return graph_runner_->forward(py_model_inputs, graph_state).hidden_states.clone();
+        return graph_runner_->forward(py_model_inputs, graph_state).hidden_states;
     }
     py::gil_scoped_acquire gil;
     RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
@@ -580,12 +589,26 @@ GptModelOutputs PyWrappedModel::forwardMixedBatch(const GptModelInputs& inputs) 
     const int64_t total_tokens  = inputs.combo_tokens.size(0);
     const int64_t decode_tokens = decode_inputs.combo_tokens.size(0);
 
+    static std::atomic<int> mixed_fwd_log_left{16};
+    const bool              log_this = mixed_fwd_log_left.fetch_sub(1) > 0;
+    if (log_this) {
+        RTP_LLM_LOG_INFO("mixed-batch begin decode_tokens=%ld context_tokens=%ld total=%ld",
+                         long(decode_tokens),
+                         long(total_tokens - decode_tokens),
+                         long(total_tokens));
+    }
+
     torch::Tensor decode_hidden = runPyModelSubBatch(decode_model_inputs);
     RTP_LLM_CHECK_WITH_INFO(decode_hidden.size(0) == decode_tokens,
                             "decode sub-batch returned %ld rows, expected %ld",
                             decode_hidden.size(0),
                             decode_tokens);
-    auto hidden_states = torch::empty({total_tokens, decode_hidden.size(1)}, decode_hidden.options());
+    if (log_this) {
+        RTP_LLM_LOG_INFO("mixed-batch decode done, allocating combo hidden on default pool");
+    }
+    // Do not inherit decode_hidden.options(): graph-pool StorageImpl leaks into
+    // this combo buffer and the following eager prefill torch::empty.
+    auto hidden_states = emptyOnDefaultCudaPool(total_tokens, decode_hidden.size(1), decode_hidden);
     hidden_states.slice(0, 0, decode_tokens).copy_(decode_hidden);
 
     torch::Tensor context_hidden = runPyModelSubBatch(context_model_inputs);
@@ -594,6 +617,9 @@ GptModelOutputs PyWrappedModel::forwardMixedBatch(const GptModelInputs& inputs) 
                             context_hidden.size(0),
                             total_tokens - decode_tokens);
     hidden_states.slice(0, decode_tokens, total_tokens).copy_(context_hidden);
+    if (log_this) {
+        RTP_LLM_LOG_INFO("mixed-batch context done, merging into combo hidden");
+    }
 
     if (!inputs.warmup && inputs.pd_separation) {
         cache_store_async_writer_->waitAllDone();
@@ -672,7 +698,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             py_model_inputs.attention_inputs.is_s_padded = true;
             py_model_outputs                             = graph_runner_->forward(py_model_inputs, graph_state);
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] CUDA graph forward completed");
-            hidden_states = py_model_outputs.hidden_states.clone();
+            hidden_states = py_model_outputs.hidden_states;
         } else {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
