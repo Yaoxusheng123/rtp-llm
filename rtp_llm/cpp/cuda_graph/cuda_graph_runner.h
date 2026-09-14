@@ -73,7 +73,7 @@ public:
     void           capturePrefill();
     void           captureDecodeOneBatchSize(int bs);
     void           capturePrefillOneSeqLen(int seq_len);
-    void           prepareInputs(const PyModelInputs& inputs, CudaGraphState& state);
+    void           prepareInputs(const PyModelInputs& inputs, CudaGraphState& state, bool log_this = false);
     bool           canRun(const PyModelInputs& inputs, CudaGraphState& state) override;
     void           replayGraph(int key);
     void           replayDecode(int bs);

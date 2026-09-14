@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <climits>
 #include <cstring>
+#include <thread>
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "torch/csrc/autograd/generated/variable_factories.h"
@@ -25,6 +28,51 @@ torch::Tensor copyHiddenStatesOffGraphPool(const torch::Tensor& src) {
         dst.copy_(src);
     }
     return dst;
+}
+
+// Host-side poll so a hung replay prints instead of blocking the engine loop forever.
+bool waitEventWithTimeout(torch::Event& event, int timeout_ms, const char* what) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!event.query()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            RTP_LLM_LOG_ERROR("CUDA graph %s did not finish in %d ms (GPU hang)", what, timeout_ms);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+void logHostIntStats(const char* name, const torch::Tensor& t, int n) {
+    if (!t.defined() || t.numel() <= 0) {
+        RTP_LLM_LOG_INFO("CUDA graph %s undefined", name);
+        return;
+    }
+    if (!t.device().is_cpu() || t.scalar_type() != torch::kInt32) {
+        RTP_LLM_LOG_INFO("CUDA graph %s not host-int32 device=%s dtype=%s numel=%ld dim=%d",
+                         name,
+                         t.device().str().c_str(),
+                         std::string(c10::toString(t.scalar_type())).c_str(),
+                         long(t.numel()),
+                         int(t.dim()));
+        return;
+    }
+    const int* p     = t.data_ptr<int>();
+    const int  count = std::min<int>(n > 0 ? n : int(t.numel()), int(t.numel()));
+    int        lo    = INT_MAX;
+    int        hi    = INT_MIN;
+    for (int i = 0; i < count; ++i) {
+        lo = std::min(lo, p[i]);
+        hi = std::max(hi, p[i]);
+    }
+    RTP_LLM_LOG_INFO("CUDA graph %s n=%d min=%d max=%d dim=%d shape0=%ld shape1=%ld",
+                     name,
+                     count,
+                     lo,
+                     hi,
+                     int(t.dim()),
+                     long(t.size(0)),
+                     t.dim() > 1 ? long(t.size(1)) : 0L);
 }
 
 // Switch the current PyTorch stream for the lifetime of the object. Capture and
@@ -80,7 +128,7 @@ void optimizedCopyAsync(const torch::Tensor& src, torch::Tensor& dst, size_t siz
     }
 }
 
-void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState& state) {
+void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState& state, bool log_this) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs");
     // 1. non spec cuda graph:
     // is_prefill_cuda_graph_mode_ is set true only when use embedding model
@@ -325,8 +373,10 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
     // A missing method must not throw AttributeError and abort replay.
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs(prepare_cuda_graph)");
+        const char* attn_prep = "none";
         if (!attn_pyobj.is_none() && py::hasattr(attn_pyobj, "prepare_cuda_graph")) {
             attn_pyobj.attr("prepare_cuda_graph")(py_model_inputs_.attention_inputs);
+            attn_prep = "prepare_cuda_graph";
         } else if (py::hasattr(py_instance_, "fill_params") && py::hasattr(py_instance_, "params_dict")) {
             const int capture_key =
                 is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
@@ -338,7 +388,22 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
                                                  state.current_batch_size,
                                                  capture_key,
                                                  kernel_seq_size_per_block_);
+                attn_prep = "fill_params";
+            } else {
+                attn_prep = "fill_params_skipped";
             }
+        }
+        if (log_this) {
+            RTP_LLM_LOG_INFO("CUDA graph attn prep=%s live_bs=%d graph_key=%d",
+                             attn_prep,
+                             state.current_batch_size,
+                             is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len :
+                                                           state.current_real_graph_bs);
+            logHostIntStats("sequence_lengths", py_model_inputs_.attention_inputs.sequence_lengths, state.current_real_graph_bs);
+            logHostIntStats("input_lengths", py_model_inputs_.attention_inputs.input_lengths, state.current_real_graph_bs);
+            logHostIntStats("kv_block_id_host",
+                            py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
+                            0);
         }
     }
 }
@@ -370,11 +435,25 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
                 state.current_real_graph_seq_len);
         }
 
-        prepareInputs(inputs, state);
+        prepareInputs(inputs, state, log_this);
         inputs_ready_event_.record(capture_stream_);
         if (log_this) {
             RTP_LLM_LOG_INFO("CUDA graph prepareInputs done, inputs_ready recorded");
         }
+    }
+
+    // Match capture's replayAndSyncCheck: default stream must be idle before
+    // live replay. Leftover eager-prefill work on this stream is a common
+    // source of graph-internal stream waits hanging.
+    if (log_this) {
+        RTP_LLM_LOG_INFO("CUDA graph drain default stream before replay");
+    }
+    {
+        py::gil_scoped_release release;
+        cuda_graph::graphGetCurrentStream().synchronize();
+    }
+    if (log_this) {
+        RTP_LLM_LOG_INFO("CUDA graph default stream drained");
     }
 
     if (log_this) {
@@ -402,7 +481,15 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     }
     forward_event_.record(cuda_graph::graphGetCurrentStream());
     if (log_this) {
-        RTP_LLM_LOG_INFO("CUDA graph replay launched on default stream");
+        RTP_LLM_LOG_INFO("CUDA graph replay launched on default stream, polling GPU");
+    }
+    {
+        py::gil_scoped_release release;
+        if (waitEventWithTimeout(forward_event_, 5000, "replay")) {
+            if (log_this) {
+                RTP_LLM_LOG_INFO("CUDA graph replay GPU completed");
+            }
+        }
     }
     // Same stream as replay: allocate on the default caching allocator, then
     // copy. clone() would keep the graph-pool StorageImpl.

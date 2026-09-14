@@ -534,7 +534,13 @@ torch::Tensor PyWrappedModel::runPyModelSubBatch(torch_ext::PyModelInputs& py_mo
                           py_model_inputs.attention_inputs.is_prefill,
                           graph_state.current_real_graph_bs);
         py_model_inputs.attention_inputs.is_s_padded = true;
-        return graph_runner_->forward(py_model_inputs, graph_state).hidden_states;
+        auto hidden = graph_runner_->forward(py_model_inputs, graph_state).hidden_states;
+        static std::atomic<int> sub_graph_log_left{16};
+        if (sub_graph_log_left.fetch_sub(1) > 0) {
+            RTP_LLM_LOG_INFO("[PyWrappedModel] sub-batch CUDA graph forward returned rows=%ld",
+                             hidden.defined() ? long(hidden.size(0)) : -1L);
+        }
+        return hidden;
     }
     py::gil_scoped_acquire gil;
     RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
@@ -625,6 +631,10 @@ GptModelOutputs PyWrappedModel::forwardMixedBatch(const GptModelInputs& inputs) 
         cache_store_async_writer_->waitAllDone();
     }
 
+    if (log_this) {
+        RTP_LLM_LOG_INFO("[PyWrappedModel] mixed-batch entering callForwardPostLayers rows=%ld",
+                         hidden_states.defined() ? long(hidden_states.size(0)) : -1L);
+    }
     return callForwardPostLayers(hidden_states, inputs, true);
 }
 
@@ -697,7 +707,13 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 graph_state.current_real_graph_bs);
             py_model_inputs.attention_inputs.is_s_padded = true;
             py_model_outputs                             = graph_runner_->forward(py_model_inputs, graph_state);
-            RTP_LLM_LOG_DEBUG("[PyWrappedModel] CUDA graph forward completed");
+            static std::atomic<int> graph_ret_log_left{16};
+            if (graph_ret_log_left.fetch_sub(1) > 0) {
+                RTP_LLM_LOG_INFO("[PyWrappedModel] CUDA graph forward returned rows=%ld",
+                                 py_model_outputs.hidden_states.defined() ?
+                                     long(py_model_outputs.hidden_states.size(0)) :
+                                     -1L);
+            }
             hidden_states = py_model_outputs.hidden_states;
         } else {
             py::gil_scoped_acquire gil;
@@ -718,7 +734,13 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             cache_store_async_writer_->waitAllDone();
         }
 
-        RTP_LLM_LOG_DEBUG("Python object instance forward method called successfully.");
+        static std::atomic<int> post_log_left{16};
+        if (post_log_left.fetch_sub(1) > 0) {
+            RTP_LLM_LOG_INFO("[PyWrappedModel] entering callForwardPostLayers rows=%ld decode_bs=%ld ctx_bs=%ld",
+                             hidden_states.defined() ? long(hidden_states.size(0)) : -1L,
+                             long(decode_batch_size),
+                             long(context_batch_size));
+        }
         if (device_props_.enable_prefill_cp) {
             size_t num_valid_tokens = context_parallel_processor_->handleOutputs(hidden_states, inputs, cp_params);
             return callForwardPostLayers(hidden_states, inputs, true, num_valid_tokens);
@@ -854,7 +876,19 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
 
         printTorchTensorData(last_hidden, "last_hidden");
 
+        static std::atomic<int> lm_head_log_left{16};
+        const bool              log_lm_head = lm_head_log_left.fetch_sub(1) > 0;
+        if (log_lm_head) {
+            RTP_LLM_LOG_INFO("[PyWrappedModel] lmHead begin rows=%ld cols=%ld",
+                             long(last_hidden.size(0)),
+                             last_hidden.dim() > 1 ? long(last_hidden.size(1)) : 0L);
+        }
         auto logits = lmHeadGemm(last_hidden, lm_head->kernel);
+        if (log_lm_head) {
+            RTP_LLM_LOG_INFO("[PyWrappedModel] lmHead done rows=%ld cols=%ld",
+                             long(logits.size(0)),
+                             logits.dim() > 1 ? long(logits.size(1)) : 0L);
+        }
         printTorchTensorData(logits, "logits");
         if (device_props_.tp_size > 1) {
             logits = tpSyncEmbeddingOrLogits(logits);
