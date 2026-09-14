@@ -152,8 +152,12 @@ private:
     std::vector<int32_t> kv_cache_layer_to_group_;
     int32_t              kv_cache_group_num_ = 0;
 
-    // event to record forward done
-    torch::Event forward_event_ = cuda_graph::makeGraphEvent();
+    // prepareInputs writes graph-pool tensors on capture_stream_; default stream
+    // waits on this before replay. forward_event_ is recorded on the default
+    // stream after replay so the next prepareInputs does not overwrite buffers
+    // still in use.
+    torch::Event inputs_ready_event_ = cuda_graph::makeGraphEvent();
+    torch::Event forward_event_      = cuda_graph::makeGraphEvent();
 };
 
 }  // namespace rtp_llm
