@@ -43,6 +43,37 @@ bool waitEventWithTimeout(torch::Event& event, int timeout_ms, const char* what)
     return true;
 }
 
+int firstPositiveBlockId(const torch::Tensor& host_table, int live_bs) {
+    if (!host_table.defined() || !host_table.device().is_cpu() || host_table.scalar_type() != torch::kInt32
+        || host_table.dim() != 2 || live_bs <= 0) {
+        return 0;
+    }
+    const int rows = std::min(live_bs, int(host_table.size(0)));
+    const int cols = int(host_table.size(1));
+    if (rows <= 0 || cols <= 0) {
+        return 0;
+    }
+    const int* p = host_table.data_ptr<int>();
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            if (p[r * cols + c] > 0) {
+                return p[r * cols + c];
+            }
+        }
+    }
+    return 0;
+}
+
+void padUnusedBlockTable(torch::Tensor& table, int live_bs, int graph_bs, int dummy_block) {
+    if (!table.defined() || table.dim() != 2 || dummy_block <= 0 || live_bs >= graph_bs
+        || table.size(0) < graph_bs || table.size(1) <= 0) {
+        return;
+    }
+    auto unused = table.slice(0, live_bs, graph_bs);
+    unused.fill_(0);
+    unused.select(1, 0).fill_(dummy_block);
+}
+
 void logHostIntStats(const char* name, const torch::Tensor& t, int n) {
     if (!t.defined() || t.numel() <= 0) {
         RTP_LLM_LOG_INFO("CUDA graph %s undefined", name);
@@ -350,6 +381,41 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
             py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.slice(0, state.current_batch_size, graph_bs)
                 .fill_(1);
         }
+        // Unused graph slots used to keep block_id=0. FlashInfer decode then
+        // attends physical page 0 (reserved / invalid) and live replay hangs.
+        // Point dummy rows at a live page; seq_len=1 only reads the first block.
+        const int dummy_block =
+            firstPositiveBlockId(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
+                                 state.current_batch_size);
+        padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
+                            state.current_batch_size,
+                            graph_bs,
+                            dummy_block);
+        padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device,
+                            state.current_batch_size,
+                            graph_bs,
+                            dummy_block);
+        if (has_hybrid_cache) {
+            for (size_t g = 0; g < hybrid_cache_group; ++g) {
+                const int group_dummy = firstPositiveBlockId(
+                    py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host_by_group[g],
+                    state.current_batch_size);
+                padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host_by_group[g],
+                                    state.current_batch_size,
+                                    graph_bs,
+                                    group_dummy > 0 ? group_dummy : dummy_block);
+                padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device_by_group[g],
+                                    state.current_batch_size,
+                                    graph_bs,
+                                    group_dummy > 0 ? group_dummy : dummy_block);
+            }
+        }
+        if (log_this) {
+            RTP_LLM_LOG_INFO("CUDA graph padded unused slots [%d,%d) with dummy block %d",
+                             state.current_batch_size,
+                             graph_bs,
+                             dummy_block);
+        }
     }
     if (is_prefill_cuda_graph_mode_) {
         if (state.current_batch_size < max_bs_) {
@@ -489,6 +555,9 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
             if (log_this) {
                 RTP_LLM_LOG_INFO("CUDA graph replay GPU completed");
             }
+        } else {
+            RTP_LLM_CHECK_WITH_INFO(false,
+                                    "CUDA graph replay hung; refusing to copy outputs or continue mixed-batch");
         }
     }
     // Same stream as replay: allocate on the default caching allocator, then
