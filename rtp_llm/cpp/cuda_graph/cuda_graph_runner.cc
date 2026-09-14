@@ -92,8 +92,9 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
     // 2.2.3 draft model do auto-agressive forward
     // for now we only support 2.2.1 and 2.2.3 in deocode cuda graph, and 2.2.2 will be support in prefill cuda graph.
 
-    // should wait last forward done before prepare inputs
-    forward_event_.synchronize();
+    // Wait on the GPU only: a host synchronize here can deadlock a live
+    // mixed-batch replay that is still queued on capture_stream_.
+    forward_event_.block(cuda_graph::graphGetCurrentStream());
 
     const size_t graph_idx =
         is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
@@ -350,61 +351,64 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     static std::atomic<int> graph_fwd_log_left{16};
     const bool              log_this = graph_fwd_log_left.fetch_sub(1) > 0;
 
-    // prepareInputs writes graph-pool tensors (fill_, fused copies, unused-slot
-    // padding). Doing that on the default stream and then cudaDeviceSynchronize
-    // deadlocks the first live mixed-batch replay. Capture-time replayAndSyncCheck
-    // never calls prepareInputs, which is why capture succeeded.
-    CaptureStreamGuard capture_guard(capture_stream_);
-
-    if (log_this) {
-        RTP_LLM_LOG_INFO("CUDA graph replay on capture stream prefill=%d bs=%d seq=%d graph_bs=%d graph_seq=%d",
-                         int(is_prefill_cuda_graph_mode_),
-                         state.current_batch_size,
-                         state.current_seq_len,
-                         state.current_real_graph_bs,
-                         state.current_real_graph_seq_len);
-    }
-
-    prepareInputs(inputs, state);
-    if (log_this) {
-        RTP_LLM_LOG_INFO("CUDA graph prepareInputs done");
-    }
-
+    // prepareInputs + replay stay on capture_stream_ (same FIFO as capture).
+    // Do not host-synchronize that stream after replay: the first live
+    // mixed-batch hang was exactly capture_stream_.synchronize() waiting for
+    // a replay that never finished. Record an event and have the default
+    // stream wait on it instead, then copy off the graph pool.
     {
-        py::gil_scoped_release release;
+        CaptureStreamGuard capture_guard(capture_stream_);
+
         if (log_this) {
-            RTP_LLM_LOG_INFO("CUDA graph pre-replay stream sync begin");
+            RTP_LLM_LOG_INFO("CUDA graph replay on capture stream prefill=%d bs=%d seq=%d graph_bs=%d graph_seq=%d",
+                             int(is_prefill_cuda_graph_mode_),
+                             state.current_batch_size,
+                             state.current_seq_len,
+                             state.current_real_graph_bs,
+                             state.current_real_graph_seq_len);
         }
-        capture_stream_.synchronize();
+
+        prepareInputs(inputs, state);
         if (log_this) {
-            RTP_LLM_LOG_INFO("CUDA graph pre-replay stream sync done, launching replay");
+            RTP_LLM_LOG_INFO("CUDA graph prepareInputs done");
         }
-        if (is_prefill_cuda_graph_mode_) {
-            RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayPrefill)");
-            replayPrefill(state.current_real_graph_seq_len);
-            outputs.hidden_states =
-                graph_instances_[state.current_real_graph_seq_len].mem_hold_.decoder_layer_hidden_states_.slice(
-                    0, 0, state.current_seq_len);
-        } else {
-            RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
-            replayDecode(state.current_real_graph_bs);
-            outputs.hidden_states =
-                graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
-                    0, 0, state.seq_len_sum);
-        }
-        if (log_this) {
-            RTP_LLM_LOG_INFO("CUDA graph replay launched, post-replay stream sync begin");
-        }
-        capture_stream_.synchronize();
-        if (log_this) {
-            RTP_LLM_LOG_INFO("CUDA graph post-replay stream sync done");
+
+        {
+            py::gil_scoped_release release;
+            if (is_prefill_cuda_graph_mode_) {
+                RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayPrefill)");
+                replayPrefill(state.current_real_graph_seq_len);
+                outputs.hidden_states =
+                    graph_instances_[state.current_real_graph_seq_len].mem_hold_.decoder_layer_hidden_states_.slice(
+                        0, 0, state.current_seq_len);
+            } else {
+                RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
+                replayDecode(state.current_real_graph_bs);
+                outputs.hidden_states =
+                    graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
+                        0, 0, state.seq_len_sum);
+            }
+            if (log_this) {
+                RTP_LLM_LOG_INFO("CUDA graph replay launched, recording event");
+            }
+            forward_event_.record(capture_stream_);
+            if (log_this) {
+                RTP_LLM_LOG_INFO("CUDA graph replay event recorded");
+            }
         }
     }
-    // GIL held: copy into a tensor allocated on the default caching allocator.
-    // clone() would keep the graph-pool StorageImpl and leak it into mixed-batch.
+
+    if (log_this) {
+        RTP_LLM_LOG_INFO("CUDA graph default stream wait on replay event");
+    }
+    forward_event_.block(cuda_graph::graphGetCurrentStream());
+    if (log_this) {
+        RTP_LLM_LOG_INFO("CUDA graph default stream wait armed");
+    }
+    // GIL held: allocate on the default caching allocator, then copy. copy_
+    // is queued on the default stream after the event wait, so it cannot
+    // start until replay finishes. clone() would keep the graph-pool StorageImpl.
     outputs.hidden_states = copyHiddenStatesOffGraphPool(outputs.hidden_states);
-    capture_stream_.synchronize();
-    forward_event_.record(capture_stream_);
     if (log_this) {
         RTP_LLM_LOG_INFO("CUDA graph replay copied off graph pool rows=%ld cols=%ld",
                          long(outputs.hidden_states.size(0)),
