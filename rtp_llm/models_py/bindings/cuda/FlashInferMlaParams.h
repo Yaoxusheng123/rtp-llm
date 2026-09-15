@@ -40,7 +40,9 @@ private:
                        int  batch_reuse_info_size,
                        bool keep_reserved_shapes = false);
 
-    // Internal method to fill params directly into HOST tensors
+    // Internal method to fill params directly into HOST tensors.
+    // fixed_page_stride: CUDA-graph capture/replay must keep one page-table
+    // slot per allocated column (same layout plan() baked), not compact used pages.
     void fillParamsInternal(torch::Tensor t_prefix_lengths,
                             torch::Tensor t_sequence_lengths,
                             torch::Tensor t_input_lengths,
@@ -50,7 +52,8 @@ private:
                             int&          input_token_num,
                             int&          page_num,
                             int&          reuse_page_num,
-                            int&          batch_reuse_info_size);
+                            int&          batch_reuse_info_size,
+                            bool          fixed_page_stride = false);
 
     // Ensure tensors are allocated with sufficient size.
     // forbid_realloc: when true (replay path only), throw if realloc would be needed.
@@ -71,8 +74,9 @@ public:
                     torch::Tensor t_input_lengths,
                     torch::Tensor t_kv_cache_block_id_host,
                     int           seq_size_per_block,
-                    bool          forbid_realloc      = false,
-                    bool          keep_reserved_shapes = false);
+                    bool          forbid_realloc       = false,
+                    bool          keep_reserved_shapes = false,
+                    bool          fixed_page_stride    = false);
 
     // Tensor views into buf_h and buf_d
     torch::Tensor batch_indice_h;

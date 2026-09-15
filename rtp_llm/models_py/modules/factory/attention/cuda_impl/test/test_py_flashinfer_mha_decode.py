@@ -393,8 +393,6 @@ class TestPyFlashinferDecodeCudaGraph(BaseAttentionTest):
 
     def test_replay_updates_page_tables(self):
         """Page table buffers must reflect the replay inputs, not capture inputs."""
-        import math
-
         config = self._create_config(seq_size_per_block=64)
         capture_bs = 4
         capture_seq_lens = [64, 128, 256, 512]
@@ -414,12 +412,10 @@ class TestPyFlashinferDecodeCudaGraph(BaseAttentionTest):
         )
         attn_op.prepare_for_cuda_graph_replay(run_inputs)
 
-        # Verify page_indptr matches run_seq_lens
+        # CUDA-graph replay keeps the capture page-table width (not compact used pages).
         page_indptr = fmha_params.decode_page_indptr_h.tolist()
-        expected_blocks = [math.ceil(s / 64) for s in run_seq_lens]
-        expected_indptr = [0]
-        for nb in expected_blocks:
-            expected_indptr.append(expected_indptr[-1] + nb)
+        pages_per_seq = int(run_inputs.kv_cache_kernel_block_id_host.size(1))
+        expected_indptr = [i * pages_per_seq for i in range(run_bs + 1)]
 
         for i in range(run_bs + 1):
             self.assertEqual(

@@ -708,6 +708,7 @@ class PyFlashinferDecodeAttnOp(object):
             self.seq_size_per_block,
             forbid_realloc=forbid_realloc,
             keep_reserved_shapes=self._decode_wrapper_cuda_graph_ready,
+            fixed_page_stride=self.enable_cuda_graph,
         )
 
         if self.enable_cuda_graph and not self._decode_wrapper_cuda_graph_ready:
@@ -767,12 +768,13 @@ class PyFlashinferDecodeAttnOp(object):
             self.seq_size_per_block,
             forbid_realloc=True,
             keep_reserved_shapes=True,
+            fixed_page_stride=True,
         )
         if self._cuda_graph_replay_logs_left > 0:
             self._cuda_graph_replay_logs_left -= 1
             logging.info(
                 "FlashInfer decode CUDA graph replay fill_params page_indice=%d "
-                "indptr_end=%s last_page_len_n=%d",
+                "indptr_end=%s last_page_len_n=%d fixed_page_stride=1",
                 int(self.fmha_params.page_indice_d.numel()),
                 (
                     int(self.fmha_params.decode_page_indptr_h[-1].item())

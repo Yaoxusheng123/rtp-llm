@@ -214,7 +214,8 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
                                                  int&          input_token_num,
                                                  int&          page_num,
                                                  int&          reuse_page_num,
-                                                 int&          batch_reuse_info_size) {
+                                                 int&          batch_reuse_info_size,
+                                                 bool          fixed_page_stride) {
     const int max_batch_blocks = t_kv_cache_block_id_host.defined() && t_kv_cache_block_id_host.size(0) > 0 ?
                                      t_kv_cache_block_id_host.size(1) :
                                      -1;
@@ -326,6 +327,12 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
         max_kv_len                    = std::max(seq_len, max_kv_len);
 
         int current_page_num = (seq_len + seq_size_per_block - 1) / seq_size_per_block;
+        // Official CUDA-graph decode wrapper bakes plan() against the capture
+        // page-table width. Compact packing on replay makes the kernel walk
+        // stale / overlapping indices and IMA on larger graph keys.
+        if (fixed_page_stride && max_batch_blocks > 0) {
+            current_page_num = max_batch_blocks;
+        }
         RTP_LLM_CHECK_WITH_INFO(total_page_idx + current_page_num <= max_page_num_,
                                 "page_num exceed reserved %d > %d",
                                 total_page_idx + current_page_num,
@@ -417,7 +424,8 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
                                          torch::Tensor t_kv_cache_block_id_host,
                                          int           seq_size_per_block,
                                          bool          forbid_realloc,
-                                         bool          keep_reserved_shapes) {
+                                         bool          keep_reserved_shapes,
+                                         bool          fixed_page_stride) {
     const int batch_size = t_input_lengths.size(0);
 
     // First pass: calculate required sizes accurately
@@ -445,7 +453,11 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
             input_token_num += 1;
             seq_len = sequence_lengths_ptr[i] + 1;
         }
-        page_num += (seq_len + seq_size_per_block - 1) / seq_size_per_block;
+        if (fixed_page_stride && t_kv_cache_block_id_host.defined() && t_kv_cache_block_id_host.size(1) > 0) {
+            page_num += static_cast<int>(t_kv_cache_block_id_host.size(1));
+        } else {
+            page_num += (seq_len + seq_size_per_block - 1) / seq_size_per_block;
+        }
     }
 
     // Ensure tensors are allocated with sufficient size
@@ -461,7 +473,8 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
                        input_token_num,
                        page_num,
                        reuse_page_num,
-                       batch_reuse_info_size);
+                       batch_reuse_info_size,
+                       fixed_page_stride);
 
     // Refresh buffer (copy to DEVICE and update shapes)
     refreshBuffer(batch_size, input_token_num, page_num, reuse_page_num, batch_reuse_info_size, keep_reserved_shapes);
@@ -523,14 +536,16 @@ void registerPyFlashInferMlaParams(pybind11::module& m) {
                torch::Tensor                     kv_cache_block_id_host,
                int                               seq_size_per_block,
                bool                              forbid_realloc,
-               bool                              keep_reserved_shapes) {
+               bool                              keep_reserved_shapes,
+               bool                              fixed_page_stride) {
                 self.fillParams(prefix_lengths,
                                 sequence_lengths,
                                 input_lengths,
                                 kv_cache_block_id_host,
                                 seq_size_per_block,
                                 forbid_realloc,
-                                keep_reserved_shapes);
+                                keep_reserved_shapes,
+                                fixed_page_stride);
             },
             pybind11::arg("prefix_lengths"),
             pybind11::arg("sequence_lengths"),
@@ -539,6 +554,7 @@ void registerPyFlashInferMlaParams(pybind11::module& m) {
             pybind11::arg("seq_size_per_block"),
             pybind11::arg("forbid_realloc")       = false,
             pybind11::arg("keep_reserved_shapes") = false,
+            pybind11::arg("fixed_page_stride")    = false,
             "Fill parameters for attention execution (forbid_realloc=true only when called from prepare_cuda_graph/replay)")
         // HOST tensors (_h suffix)
         .def_readonly("batch_indice_h", &FlashInferMlaAttnParams::batch_indice_h, "Batch indices on HOST")
