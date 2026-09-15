@@ -29,6 +29,7 @@ public:
         max_seq_len_(graph_params.max_seq_len),
         seq_size_per_block_(graph_params.tokens_per_block),
         kernel_seq_size_per_block_(graph_params.kernel_tokens_per_block),
+        max_block_size_per_item_(graph_params.max_block_size_per_item),
         hidden_size_(graph_params.hidden_size),
         sp_steps_(graph_params.sp_steps),
         prefill_capture_seq_lens_(graph_params.prefill_capture_seq_lens),
@@ -51,7 +52,8 @@ public:
         options_cuda_float_ = torch::TensorOptions().dtype(model_data_type_).device(torch::kCUDA).requires_grad(false);
         RTP_LLM_LOG_INFO("Initialize CudaGraphRunner with parameters below: \n \
             enable_cuda_graph_: %d, max_bs_: %d, enable_cuda_graph_debug_mode_: %d, max_seq_len_: %d, kernel_seq_size_per_block_: %d, \
-            hidden_size_: %d, num_tokens_per_bs_: %d, is_prefill_cuda_graph_mode_: %d, is_target_verify_: %d",
+            hidden_size_: %d, num_tokens_per_bs_: %d, is_prefill_cuda_graph_mode_: %d, is_target_verify_: %d, \
+            max_block_size_per_item_: %d",
                          enable_cuda_graph_,
                          max_bs_,
                          enable_cuda_graph_debug_mode_,
@@ -60,7 +62,8 @@ public:
                          hidden_size_,
                          num_tokens_per_bs_,
                          is_prefill_cuda_graph_mode_,
-                         is_target_verify_);
+                         is_target_verify_,
+                         max_block_size_per_item_);
     }
 
     ~CudaGraphRunner() {
@@ -118,6 +121,10 @@ private:
     void                    initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs);
     void                    initCaptureBertEmbeddingInputs(PyModelInputs& inputs, int max_bs, int max_num_token);
     void                    initCaptureAttentionInputsPost();
+    // Pages baked into FlashInfer plan() / capture page tables. Capped by
+    // max_block_size_per_item so replay cannot walk more pages than KV cache
+    // will ever allocate for one request.
+    int                     capturePageTableWidth() const;
     py::object              py_forward_method_;
     py::object              py_attn_pyobj_method_;
     bool                    enable_cuda_graph_{false};
@@ -131,6 +138,7 @@ private:
     int                     max_seq_len_{0};
     int                     seq_size_per_block_{0};
     int                     kernel_seq_size_per_block_{0};
+    int                     max_block_size_per_item_{0};
     int                     hidden_size_{0};
     int                     sp_steps_{0};
     std::vector<int>        capture_range_;

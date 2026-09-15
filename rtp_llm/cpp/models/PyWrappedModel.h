@@ -211,6 +211,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
             graph_params.max_seq_len                  = params.max_seq_len;
             graph_params.tokens_per_block             = params.tokens_per_block;
             graph_params.kernel_tokens_per_block      = params.kernel_tokens_per_block;
+            graph_params.max_block_size_per_item      = static_cast<int>(params.runtime_config.max_block_size_per_item);
             graph_params.hidden_size                  = params.hidden_size;
             graph_params.model_data_type              = dtype;
             graph_params.max_context_batch_size       = params.concurrency_config.concurrency_limit;

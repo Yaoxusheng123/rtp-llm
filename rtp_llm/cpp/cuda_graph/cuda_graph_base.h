@@ -25,6 +25,10 @@ struct GraphParams {
     int                  max_seq_len                  = 0;
     int                  tokens_per_block             = 0;  // physical kv block size
     int                  kernel_tokens_per_block      = 0;  // must be explicitly configured
+    // Cache-manager cap on pages per request. 0 = derive width from max_seq_len.
+    // FlashInfer plan() is baked at capture; dummy seq / page-table width must
+    // not exceed this or replay walks unallocated pages (IMA on larger keys).
+    int                  max_block_size_per_item      = 0;
     int                  num_tokens_per_bs = 1;  // Number of tokens per batch (1 for decode, max_seq_len for prefill)
     int                  sp_steps          = 0;
     size_t               max_context_batch_size = 128;

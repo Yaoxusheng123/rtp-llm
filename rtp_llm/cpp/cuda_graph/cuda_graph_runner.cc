@@ -248,10 +248,12 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
             d2d_copies.add(src.data_ptr(), dst.data_ptr(), src.numel() * src.element_size());
             return;
         }
+        const int64_t rows = std::min(src.size(0), dst.size(0));
+        const int64_t cols = std::min(src.size(1), dst.size(1));
         strided_d2d_copies.add(src.data_ptr(),
                                dst.data_ptr(),
-                               src.size(0),
-                               src.size(1) * src.element_size(),
+                               rows,
+                               cols * src.element_size(),
                                src.stride(0) * src.element_size(),
                                dst.stride(0) * dst.element_size());
     };
@@ -266,8 +268,9 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
             memcpy(dst.data_ptr(), src.data_ptr(), src.numel() * src.element_size());
             return;
         }
-        const size_t nrows      = src.size(0);
-        const size_t row_bytes  = src.size(1) * src.element_size();
+        const size_t nrows      = std::min(static_cast<size_t>(src.size(0)), static_cast<size_t>(dst.size(0)));
+        const size_t cols       = std::min(static_cast<size_t>(src.size(1)), static_cast<size_t>(dst.size(1)));
+        const size_t row_bytes  = cols * src.element_size();
         const size_t src_stride = src.stride(0) * src.element_size();
         const size_t dst_stride = dst.stride(0) * dst.element_size();
         const char*  src_ptr    = reinterpret_cast<const char*>(src.data_ptr());
@@ -744,6 +747,19 @@ int CudaGraphRunner::getCurrentRealGraphBs(const CudaGraphState& state) const {
     return state.current_real_graph_bs;
 }
 
+int CudaGraphRunner::capturePageTableWidth() const {
+    const int64_t seq_pages =
+        static_cast<int64_t>(((max_seq_len_ + seq_size_per_block_ - 1) / seq_size_per_block_) + sp_steps_);
+    int64_t max_blocks = seq_pages * seq_size_per_block_ / kernel_seq_size_per_block_;
+    if (max_block_size_per_item_ > 0) {
+        const int64_t cap_kernel =
+            (static_cast<int64_t>(max_block_size_per_item_) + sp_steps_) * seq_size_per_block_
+            / kernel_seq_size_per_block_;
+        max_blocks = std::min(max_blocks, cap_kernel);
+    }
+    return static_cast<int>(std::max(int64_t(1), max_blocks));
+}
+
 void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs) {
     inputs.attention_inputs.is_target_verify = is_target_verify_;
     inputs.attention_inputs.is_prefill       = is_prefill_cuda_graph_mode_ || num_tokens_per_bs_ > 1;
@@ -755,14 +771,20 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
     inputs.attention_inputs.input_lengths   = inputs.attention_inputs.input_lengths.pin_memory();
     inputs.attention_inputs.input_lengths_d = inputs.attention_inputs.input_lengths.cuda();
     // sequence_lengths [batch_size, int32] (decode only)
-    // sequence_length should in pinned memory
+    // sequence_length should in pinned memory. Dummy kv_len must match the
+    // capture page-table width (capped by max_block_size_per_item), otherwise
+    // FlashInfer plan() walks more pages than the cache manager will allocate.
+    const int     max_blocks      = capturePageTableWidth();
+    const int     capture_tokens  = max_blocks * kernel_seq_size_per_block_;
+    const int     dummy_seq_len   = std::max(0, capture_tokens - num_tokens_per_bs - 1);
     inputs.attention_inputs.sequence_lengths = torch::ones({int(max_bs_)}, options_cpu_int32_);
-    inputs.attention_inputs.sequence_lengths.fill_(max_seq_len_ - num_tokens_per_bs - 1);
+    inputs.attention_inputs.sequence_lengths.fill_(dummy_seq_len);
     inputs.attention_inputs.sequence_lengths = inputs.attention_inputs.sequence_lengths.pin_memory();
-
-    const int64_t max_kv_blocks =
-        static_cast<int64_t>(((max_seq_len_ + seq_size_per_block_ - 1) / seq_size_per_block_) + sp_steps_);
-    const int64_t max_blocks = max_kv_blocks * seq_size_per_block_ / kernel_seq_size_per_block_;
+    RTP_LLM_LOG_INFO("CUDA graph capture page table width=%d dummy_seq=%d max_seq_len=%d max_block_size_per_item=%d",
+                     max_blocks,
+                     dummy_seq_len,
+                     max_seq_len_,
+                     max_block_size_per_item_);
     // kv_cache_kernel_block_id_device [batch_size, block_num]
     inputs.attention_inputs.kv_cache_kernel_block_id_device =
         torch::zeros({int(max_bs_), max_blocks}, options_cuda_int32_);
@@ -799,8 +821,9 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
 
     // prefix_lengths [batch_size, int32] (for attention `prepare`)
     if (num_tokens_per_bs_ > 1 && !is_prefill_cuda_graph_mode_) {
+        const int prefix_init = std::max(0, capture_tokens - num_tokens_per_bs_);
         inputs.attention_inputs.prefix_lengths =
-            torch::full({int(max_bs_)}, max_seq_len_ - num_tokens_per_bs_, options_cpu_int32_).pin_memory();
+            torch::full({int(max_bs_)}, prefix_init, options_cpu_int32_).pin_memory();
         inputs.attention_inputs.prefix_lengths_d = inputs.attention_inputs.prefix_lengths.cuda();
     } else if (is_prefill_cuda_graph_mode_) {
         // ROCm needs prefix>0 here for AiterPrefillImplPaged.support(); CUDA keeps prefix=0.
