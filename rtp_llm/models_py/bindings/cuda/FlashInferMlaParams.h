@@ -31,9 +31,14 @@ private:
     torch::Tensor slot_mapping_h_;
     torch::Tensor slot_mapping_d_;
 
-    // Helper method to refresh buffer shapes and copy to device (single memcpy)
-    void
-    refreshBuffer(int batch_size, int input_token_num, int page_num, int reuse_page_num, int batch_reuse_info_size);
+    // Helper method to refresh buffer shapes and copy to device (single memcpy).
+    // keep_reserved_shapes: CUDA-graph replay must not shrink views the wrapper holds.
+    void refreshBuffer(int  batch_size,
+                       int  input_token_num,
+                       int  page_num,
+                       int  reuse_page_num,
+                       int  batch_reuse_info_size,
+                       bool keep_reserved_shapes = false);
 
     // Internal method to fill params directly into HOST tensors
     void fillParamsInternal(torch::Tensor t_prefix_lengths,
@@ -66,7 +71,8 @@ public:
                     torch::Tensor t_input_lengths,
                     torch::Tensor t_kv_cache_block_id_host,
                     int           seq_size_per_block,
-                    bool          forbid_realloc = false);
+                    bool          forbid_realloc      = false,
+                    bool          keep_reserved_shapes = false);
 
     // Tensor views into buf_h and buf_d
     torch::Tensor batch_indice_h;

@@ -64,14 +64,58 @@ int firstPositiveBlockId(const torch::Tensor& host_table, int live_bs) {
     return 0;
 }
 
-void padUnusedBlockTable(torch::Tensor& table, int live_bs, int graph_bs, int dummy_block) {
-    if (!table.defined() || table.dim() != 2 || dummy_block <= 0 || live_bs >= graph_bs
+int usedPagesForRow(const torch::Tensor& sequence_lengths, int row, int live_bs, int page_size, int cols) {
+    int seq = 1;
+    if (row < live_bs && sequence_lengths.defined() && sequence_lengths.numel() > row
+        && sequence_lengths.device().is_cpu() && sequence_lengths.scalar_type() == torch::kInt32) {
+        seq = sequence_lengths.data_ptr<int>()[row] + 1;
+        if (seq < 1) {
+            seq = 1;
+        }
+    }
+    if (page_size <= 0) {
+        return 1;
+    }
+    const int used = (seq + page_size - 1) / page_size;
+    return std::max(1, std::min(used, cols));
+}
+
+// Fill every unused page-table slot (dummy rows and live unused columns) with a
+// valid block. Capture walks max_pages per request; leftover 0s are reserved.
+void padUnusedPageSlots(torch::Tensor&       table,
+                        const torch::Tensor& sequence_lengths,
+                        int                  live_bs,
+                        int                  graph_bs,
+                        int                  page_size,
+                        int                  dummy_block) {
+    if (!table.defined() || table.dim() != 2 || dummy_block <= 0 || graph_bs <= 0
         || table.size(0) < graph_bs || table.size(1) <= 0) {
         return;
     }
-    auto unused = table.slice(0, live_bs, graph_bs);
-    unused.fill_(0);
-    unused.select(1, 0).fill_(dummy_block);
+    const int cols     = int(table.size(1));
+    const int row_limit = std::min(graph_bs, int(table.size(0)));
+    if (table.device().is_cpu() && table.scalar_type() == torch::kInt32) {
+        int* p = table.data_ptr<int>();
+        for (int r = 0; r < row_limit; ++r) {
+            const int used = usedPagesForRow(sequence_lengths, r, live_bs, page_size, cols);
+            if (r >= live_bs) {
+                p[r * cols + 0] = dummy_block;
+            }
+            for (int c = used; c < cols; ++c) {
+                p[r * cols + c] = dummy_block;
+            }
+        }
+        return;
+    }
+    if (live_bs < graph_bs && table.size(0) >= graph_bs) {
+        table.slice(0, live_bs, graph_bs).fill_(dummy_block);
+    }
+    for (int r = 0; r < std::min(live_bs, row_limit); ++r) {
+        const int used = usedPagesForRow(sequence_lengths, r, live_bs, page_size, cols);
+        if (used < cols) {
+            table.select(0, r).slice(0, used, cols).fill_(dummy_block);
+        }
+    }
 }
 
 void logHostIntStats(const char* name, const torch::Tensor& t, int n) {
@@ -366,55 +410,67 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
     // Decode graphs are captured at the padded key (e.g. bs=51 replays the 64 graph).
     // Leftover slots keep capture-time sequence_lengths (~max_seq_len) and block_id=0,
     // which makes dummy sequences attend the full window on physical block 0.
-    if (!is_prefill_cuda_graph_mode_ && state.current_batch_size < state.current_real_graph_bs) {
+    if (!is_prefill_cuda_graph_mode_) {
         const int graph_bs = state.current_real_graph_bs;
-        py_model_inputs_.attention_inputs.sequence_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
-        if (py_model_inputs_.attention_inputs.input_lengths.size(0) >= graph_bs) {
-            py_model_inputs_.attention_inputs.input_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
+        if (state.current_batch_size < graph_bs) {
+            py_model_inputs_.attention_inputs.sequence_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
+            if (py_model_inputs_.attention_inputs.input_lengths.size(0) >= graph_bs) {
+                py_model_inputs_.attention_inputs.input_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
+            }
+            if (py_model_inputs_.attention_inputs.input_lengths_d.defined()
+                && py_model_inputs_.attention_inputs.input_lengths_d.size(0) >= graph_bs) {
+                py_model_inputs_.attention_inputs.input_lengths_d.slice(0, state.current_batch_size, graph_bs).fill_(1);
+            }
+            if (py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.defined()
+                && py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.size(0) >= graph_bs) {
+                py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.slice(0, state.current_batch_size, graph_bs)
+                    .fill_(1);
+            }
         }
-        if (py_model_inputs_.attention_inputs.input_lengths_d.defined()
-            && py_model_inputs_.attention_inputs.input_lengths_d.size(0) >= graph_bs) {
-            py_model_inputs_.attention_inputs.input_lengths_d.slice(0, state.current_batch_size, graph_bs).fill_(1);
-        }
-        if (py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.defined()
-            && py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.size(0) >= graph_bs) {
-            py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.slice(0, state.current_batch_size, graph_bs)
-                .fill_(1);
-        }
-        // Unused graph slots used to keep block_id=0. FlashInfer decode then
-        // attends physical page 0 (reserved / invalid) and live replay hangs.
-        // Point dummy rows at a live page; seq_len=1 only reads the first block.
+        // Capture plan walks max_pages per request. Live unused columns and
+        // dummy rows used to keep block_id=0; point them at a live page.
         const int dummy_block =
             firstPositiveBlockId(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
                                  state.current_batch_size);
-        padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
-                            state.current_batch_size,
-                            graph_bs,
-                            dummy_block);
-        padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device,
-                            state.current_batch_size,
-                            graph_bs,
-                            dummy_block);
+        const int page_size = kernel_seq_size_per_block_;
+        padUnusedPageSlots(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
+                           py_model_inputs_.attention_inputs.sequence_lengths,
+                           state.current_batch_size,
+                           graph_bs,
+                           page_size,
+                           dummy_block);
+        padUnusedPageSlots(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device,
+                           py_model_inputs_.attention_inputs.sequence_lengths,
+                           state.current_batch_size,
+                           graph_bs,
+                           page_size,
+                           dummy_block);
         if (has_hybrid_cache) {
             for (size_t g = 0; g < hybrid_cache_group; ++g) {
                 const int group_dummy = firstPositiveBlockId(
                     py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host_by_group[g],
                     state.current_batch_size);
-                padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host_by_group[g],
-                                    state.current_batch_size,
-                                    graph_bs,
-                                    group_dummy > 0 ? group_dummy : dummy_block);
-                padUnusedBlockTable(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device_by_group[g],
-                                    state.current_batch_size,
-                                    graph_bs,
-                                    group_dummy > 0 ? group_dummy : dummy_block);
+                const int pad_block = group_dummy > 0 ? group_dummy : dummy_block;
+                padUnusedPageSlots(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host_by_group[g],
+                                   py_model_inputs_.attention_inputs.sequence_lengths,
+                                   state.current_batch_size,
+                                   graph_bs,
+                                   page_size,
+                                   pad_block);
+                padUnusedPageSlots(py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device_by_group[g],
+                                   py_model_inputs_.attention_inputs.sequence_lengths,
+                                   state.current_batch_size,
+                                   graph_bs,
+                                   page_size,
+                                   pad_block);
             }
         }
         if (log_this) {
-            RTP_LLM_LOG_INFO("CUDA graph padded unused slots [%d,%d) with dummy block %d",
+            RTP_LLM_LOG_INFO("CUDA graph padded unused page slots live_bs=%d graph_bs=%d dummy_block=%d page_size=%d",
                              state.current_batch_size,
                              graph_bs,
-                             dummy_block);
+                             dummy_block,
+                             page_size);
         }
     }
     if (is_prefill_cuda_graph_mode_) {

@@ -1,3 +1,5 @@
+import inspect
+import logging
 from typing import Any, Optional
 
 import torch
@@ -657,13 +659,20 @@ class PyFlashinferDecodeAttnOp(object):
         self.head_dim_vo = attn_configs.size_per_head
         self.seq_size_per_block = attn_configs.kernel_tokens_per_block
         self.use_tensor_core = determine_use_tensor_core_from_configs(attn_configs)
+        self.kv_cache_dtype = attn_configs.kv_cache_dtype
+        self.enable_cuda_graph = attn_inputs.is_cuda_graph
+        # CUDA-core batch_decode bakes a length-dependent plan_info into the
+        # graph. FlashInfer's supported CUDA-graph path is the FA2 tensor-core
+        # backend, which extra CTAs can no-op when live kv_len is shorter.
+        if self.enable_cuda_graph:
+            self.use_tensor_core = True
         self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self.g_workspace_buffer,
             "HND",
             use_tensor_cores=self.use_tensor_core,
         )
-        self.kv_cache_dtype = attn_configs.kv_cache_dtype
-        self.enable_cuda_graph = attn_inputs.is_cuda_graph
+        self._decode_wrapper_cuda_graph_ready = False
+        self._cuda_graph_replay_logs_left = 16
         self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
 
     def __del__(self):
@@ -698,26 +707,35 @@ class PyFlashinferDecodeAttnOp(object):
             attn_inputs.kv_cache_kernel_block_id_host,
             self.seq_size_per_block,
             forbid_realloc=forbid_realloc,
+            keep_reserved_shapes=self._decode_wrapper_cuda_graph_ready,
         )
 
-        if self.enable_cuda_graph and self.decode_wrapper._fixed_batch_size == 0:
-            batch_size = attn_inputs.input_lengths.size(0)
-            self.decode_wrapper._use_cuda_graph = True
-            self.decode_wrapper._paged_kv_indptr_buf = (
-                self.fmha_params.decode_page_indptr_d
+        if self.enable_cuda_graph and not self._decode_wrapper_cuda_graph_ready:
+            self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.g_workspace_buffer,
+                "HND",
+                use_cuda_graph=True,
+                use_tensor_cores=True,
+                paged_kv_indptr_buffer=self.fmha_params.decode_page_indptr_d,
+                paged_kv_indices_buffer=self.fmha_params.page_indice_d,
+                paged_kv_last_page_len_buffer=self.fmha_params.paged_kv_last_page_len_d,
             )
-            self.decode_wrapper._paged_kv_last_page_len_buf = (
-                self.fmha_params.paged_kv_last_page_len_d
+            self.use_tensor_core = True
+            self._decode_wrapper_cuda_graph_ready = True
+            logging.info(
+                "FlashInfer decode CUDA graph wrapper ready batch=%d "
+                "page_indice=%d last_page_len=%d use_tensor_cores=True",
+                int(self.fmha_params.paged_kv_last_page_len_d.numel()),
+                int(self.fmha_params.page_indice_d.numel()),
+                int(self.fmha_params.paged_kv_last_page_len_d.numel()),
             )
-            self.decode_wrapper._paged_kv_indices_buf = self.fmha_params.page_indice_d
-            self.decode_wrapper._fixed_batch_size = batch_size
-            if self.use_tensor_core:
-                self.decode_wrapper._qo_indptr_buf = torch.arange(
-                    batch_size + 1,
-                    dtype=torch.int32,
-                    device=self.g_workspace_buffer.device,
-                )
 
+        plan_kwargs = {}
+        try:
+            if "disable_split_kv" in inspect.signature(self.decode_wrapper.plan).parameters:
+                plan_kwargs["disable_split_kv"] = True
+        except (TypeError, ValueError):
+            pass
         self.decode_wrapper.plan(
             self.fmha_params.decode_page_indptr_d,
             self.fmha_params.page_indice_d,
@@ -728,6 +746,7 @@ class PyFlashinferDecodeAttnOp(object):
             self.seq_size_per_block,
             q_data_type=get_scalar_type(attn_inputs.dtype),
             kv_data_type=kv_datatype,
+            **plan_kwargs,
         )
         return self.fmha_params
 
@@ -747,7 +766,21 @@ class PyFlashinferDecodeAttnOp(object):
             attn_inputs.kv_cache_kernel_block_id_host,
             self.seq_size_per_block,
             forbid_realloc=True,
+            keep_reserved_shapes=True,
         )
+        if self._cuda_graph_replay_logs_left > 0:
+            self._cuda_graph_replay_logs_left -= 1
+            logging.info(
+                "FlashInfer decode CUDA graph replay fill_params page_indice=%d "
+                "indptr_end=%s last_page_len_n=%d",
+                int(self.fmha_params.page_indice_d.numel()),
+                (
+                    int(self.fmha_params.decode_page_indptr_h[-1].item())
+                    if self.fmha_params.decode_page_indptr_h.numel() > 0
+                    else -1
+                ),
+                int(self.fmha_params.paged_kv_last_page_len_d.numel()),
+            )
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
         return True

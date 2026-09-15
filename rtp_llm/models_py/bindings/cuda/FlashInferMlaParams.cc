@@ -347,8 +347,12 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
     batch_reuse_info_size = batch_size * 4;  // 4 ints per batch entry
 }
 
-void FlashInferMlaAttnParams::refreshBuffer(
-    int batch_size, int input_token_num, int page_num, int reuse_page_num, int batch_reuse_info_size) {
+void FlashInferMlaAttnParams::refreshBuffer(int  batch_size,
+                                            int  input_token_num,
+                                            int  page_num,
+                                            int  reuse_page_num,
+                                            int  batch_reuse_info_size,
+                                            bool keep_reserved_shapes) {
     // Get current CUDA stream
     cudaStream_t stream = GET_CURRENT_STREAM();
 
@@ -356,6 +360,13 @@ void FlashInferMlaAttnParams::refreshBuffer(
     // Since all tensors are in continuous memory, we can copy the entire buffer at once
     size_t total_bytes = buf_h.numel() * sizeof(int32_t);
     cudaMemcpyAsync(buf_d.data_ptr(), buf_h.data_ptr(), total_bytes, cudaMemcpyHostToDevice, stream);
+
+    // CUDA-graph wrappers hold these tensor objects as fixed-address buffers.
+    // Shrinking the views after capture makes FlashInfer's plan()/run() see a
+    // different numel than the kernel baked into the graph.
+    if (keep_reserved_shapes) {
+        return;
+    }
 
     // Update tensor shapes (without reallocating memory)
     // Use vector<int64_t> which can be implicitly converted to c10::IntArrayRef
@@ -405,7 +416,8 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
                                          torch::Tensor t_input_lengths,
                                          torch::Tensor t_kv_cache_block_id_host,
                                          int           seq_size_per_block,
-                                         bool          forbid_realloc) {
+                                         bool          forbid_realloc,
+                                         bool          keep_reserved_shapes) {
     const int batch_size = t_input_lengths.size(0);
 
     // First pass: calculate required sizes accurately
@@ -452,7 +464,7 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
                        batch_reuse_info_size);
 
     // Refresh buffer (copy to DEVICE and update shapes)
-    refreshBuffer(batch_size, input_token_num, page_num, reuse_page_num, batch_reuse_info_size);
+    refreshBuffer(batch_size, input_token_num, page_num, reuse_page_num, batch_reuse_info_size, keep_reserved_shapes);
 
     batch_indice                 = batch_indice_d;
     page_indice                  = page_indice_d;
@@ -510,20 +522,23 @@ void registerPyFlashInferMlaParams(pybind11::module& m) {
                torch::Tensor                     input_lengths,
                torch::Tensor                     kv_cache_block_id_host,
                int                               seq_size_per_block,
-               bool                              forbid_realloc) {
+               bool                              forbid_realloc,
+               bool                              keep_reserved_shapes) {
                 self.fillParams(prefix_lengths,
                                 sequence_lengths,
                                 input_lengths,
                                 kv_cache_block_id_host,
                                 seq_size_per_block,
-                                forbid_realloc);
+                                forbid_realloc,
+                                keep_reserved_shapes);
             },
             pybind11::arg("prefix_lengths"),
             pybind11::arg("sequence_lengths"),
             pybind11::arg("input_lengths"),
             pybind11::arg("kv_cache_block_id_host"),
             pybind11::arg("seq_size_per_block"),
-            pybind11::arg("forbid_realloc") = false,
+            pybind11::arg("forbid_realloc")       = false,
+            pybind11::arg("keep_reserved_shapes") = false,
             "Fill parameters for attention execution (forbid_realloc=true only when called from prepare_cuda_graph/replay)")
         // HOST tensors (_h suffix)
         .def_readonly("batch_indice_h", &FlashInferMlaAttnParams::batch_indice_h, "Batch indices on HOST")

@@ -345,6 +345,7 @@ class TestPyFlashinferDecodeCudaGraph(BaseAttentionTest):
 
         self.assertEqual(attn_op.decode_wrapper._fixed_batch_size, capture_bs)
         self.assertTrue(attn_op.decode_wrapper._use_cuda_graph)
+        self.assertTrue(attn_op._decode_wrapper_cuda_graph_ready)
         logging.info("_fixed_batch_size correctly set after prepare()")
 
     def test_replay_does_not_replan(self):
@@ -366,6 +367,7 @@ class TestPyFlashinferDecodeCudaGraph(BaseAttentionTest):
         attn_op.prepare(capture_inputs)
 
         self.assertEqual(attn_op.decode_wrapper._fixed_batch_size, capture_bs)
+        capture_page_numel = attn_op.fmha_params.page_indice_d.numel()
 
         run_bs = 3
         run_seq_lens = [100, 200, 300]
@@ -376,6 +378,7 @@ class TestPyFlashinferDecodeCudaGraph(BaseAttentionTest):
 
         # _fixed_batch_size must stay at capture_bs (replay doesn't replan)
         self.assertEqual(attn_op.decode_wrapper._fixed_batch_size, capture_bs)
+        self.assertEqual(attn_op.fmha_params.page_indice_d.numel(), capture_page_numel)
 
         # fill_params must have updated the page table buffers on the device
         page_indptr = fmha_params.decode_page_indptr_h
