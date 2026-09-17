@@ -682,6 +682,49 @@ class PyFlashinferDecodeAttnOp(object):
         """Set the params object to be used by this op."""
         self.fmha_params = params
 
+    def _get_kv_data_type(self, attn_inputs: PyAttentionInputs):
+        if self.kv_cache_dtype == KvCacheDataType.INT8:
+            return torch.int8
+        if self.kv_cache_dtype == KvCacheDataType.FP8:
+            return torch.float8_e4m3fn
+        return get_scalar_type(attn_inputs.dtype)
+
+    def _plan_kwargs(self) -> dict:
+        kwargs = {}
+        try:
+            if "disable_split_kv" in inspect.signature(self.decode_wrapper.plan).parameters:
+                kwargs["disable_split_kv"] = True
+        except (TypeError, ValueError):
+            pass
+        return kwargs
+
+    def _plan_decode_wrapper(self, attn_inputs: PyAttentionInputs) -> None:
+        # idlefish-embedding-realse-v1.2: FA2 tensor-core decode is BatchPrefill
+        # under the hood. plan() bakes kv_len into plan_info and is NOT inside
+        # the CUDA graph, so replay must refresh it from host metadata.
+        plan_kwargs = self._plan_kwargs()
+        if self.use_tensor_core:
+            page_indptr = self.fmha_params.decode_page_indptr_h
+            page_indice = self.fmha_params.page_indice_h
+            last_page_len = self.fmha_params.paged_kv_last_page_len_h
+            plan_kwargs["non_blocking"] = True
+        else:
+            page_indptr = self.fmha_params.decode_page_indptr_d
+            page_indice = self.fmha_params.page_indice_d
+            last_page_len = self.fmha_params.paged_kv_last_page_len_d
+        self.decode_wrapper.plan(
+            page_indptr,
+            page_indice,
+            last_page_len,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.seq_size_per_block,
+            q_data_type=get_scalar_type(attn_inputs.dtype),
+            kv_data_type=self._get_kv_data_type(attn_inputs),
+            **plan_kwargs,
+        )
+
     def prepare(
         self,
         attn_inputs: PyAttentionInputs,
@@ -692,14 +735,6 @@ class PyFlashinferDecodeAttnOp(object):
 
         forbid_realloc: True only when called from prepare_cuda_graph (replay); forbids buffer realloc.
         """
-        # Convert kv_cache_dtype to torch dtype
-        if self.kv_cache_dtype == KvCacheDataType.INT8:
-            kv_datatype = torch.int8
-        elif self.kv_cache_dtype == KvCacheDataType.FP8:
-            kv_datatype = torch.float8_e4m3fn
-        else:  # BASE
-            kv_datatype = get_scalar_type(attn_inputs.dtype)
-
         self.fmha_params.fill_params(
             attn_inputs.prefix_lengths,
             attn_inputs.sequence_lengths,
@@ -731,34 +766,16 @@ class PyFlashinferDecodeAttnOp(object):
                 int(self.fmha_params.paged_kv_last_page_len_d.numel()),
             )
 
-        plan_kwargs = {}
-        try:
-            if "disable_split_kv" in inspect.signature(self.decode_wrapper.plan).parameters:
-                plan_kwargs["disable_split_kv"] = True
-        except (TypeError, ValueError):
-            pass
-        self.decode_wrapper.plan(
-            self.fmha_params.decode_page_indptr_d,
-            self.fmha_params.page_indice_d,
-            self.fmha_params.paged_kv_last_page_len_d,
-            self.local_head_num,
-            self.local_kv_head_num,
-            self.head_dim_qk,
-            self.seq_size_per_block,
-            q_data_type=get_scalar_type(attn_inputs.dtype),
-            kv_data_type=kv_datatype,
-            **plan_kwargs,
-        )
+        self._plan_decode_wrapper(attn_inputs)
         return self.fmha_params
 
     def prepare_for_cuda_graph_replay(self, attn_inputs: PyAttentionInputs) -> None:
-        """Update buffer contents for CUDA graph replay without calling plan().
+        """Refresh FlashInfer buffers and FA2 plan_info before graph replay.
 
-        During CUDA graph replay, we must NOT call plan() because it may launch
-        GPU kernels on the current stream while the graph replays on the capture
-        stream, causing a race condition. We only need to update the page table
-        buffers in-place via fill_params — the pre-allocated buffers are already
-        wired into the decode_wrapper from the initial prepare() call.
+        Borrowed from idlefish-embedding-realse-v1.2: tensor-core decode routes
+        through FA2 BatchPrefill, whose plan() is not captured. Skipping replan
+        leaves capture-time kv_len (dummy_seq) in plan_info and IMA on live replay.
+        Called on the default stream before replay, not inside the graph.
         """
         self.fmha_params.fill_params(
             attn_inputs.prefix_lengths,
@@ -770,10 +787,11 @@ class PyFlashinferDecodeAttnOp(object):
             keep_reserved_shapes=True,
             fixed_page_stride=True,
         )
+        self._plan_decode_wrapper(attn_inputs)
         if self._cuda_graph_replay_logs_left > 0:
             self._cuda_graph_replay_logs_left -= 1
             logging.info(
-                "FlashInfer decode CUDA graph replay fill_params page_indice=%d "
+                "FlashInfer decode CUDA graph replay fill_params+plan page_indice=%d "
                 "indptr_end=%s last_page_len_n=%d fixed_page_stride=1",
                 int(self.fmha_params.page_indice_d.numel()),
                 (
@@ -828,11 +846,32 @@ class PyFlashinferDecodeImpl(FMHAImplBase):
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs) -> None:
         """Prepare for CUDA graph replay; only updates buffer contents, no plan()."""
         self.fmha_impl.prepare_for_cuda_graph_replay(attn_inputs)
-        # Update rope params for correct position encoding during cuda graph replay
-        new_rope_params = self.rope_impl.prepare(attn_inputs)
-        common.copy_kv_cache_offset(
-            self.rope_params.kv_cache_offset, new_rope_params.kv_cache_offset
-        )
+        # In-place K/V offset update. convert_offset_to_block_array() allocates a
+        # new [bs, 2, pages] tensor; on the graph capture stream that allocation
+        # comes from the CUDA-graph mempool and the second live replay aliases
+        # captured FlashInfer activations (IMA). Encoding matches
+        # ConvertOffsetToBlockArrayData: K = block_id * 2, V = block_id * 2 + 1.
+        block_id = attn_inputs.kv_cache_kernel_block_id_device
+        offset = self.rope_params.kv_cache_offset
+        if (
+            block_id is not None
+            and offset is not None
+            and offset.dim() == 3
+            and offset.size(1) == 2
+            and offset.size(0) == block_id.size(0)
+            and offset.size(2) == block_id.size(1)
+        ):
+            k_off = offset.select(1, 0)
+            v_off = offset.select(1, 1)
+            k_off.copy_(block_id)
+            k_off.mul_(2)
+            v_off.copy_(block_id)
+            v_off.mul_(2).add_(1)
+        else:
+            new_rope_params = self.rope_impl.prepare(attn_inputs)
+            common.copy_kv_cache_offset(
+                self.rope_params.kv_cache_offset, new_rope_params.kv_cache_offset
+            )
 
     def support_cuda_graph(self) -> bool:
         return True

@@ -97,10 +97,13 @@ void padUnusedPageSlots(torch::Tensor&       table,
     if (table.device().is_cpu() && table.scalar_type() == torch::kInt32) {
         int* p = table.data_ptr<int>();
         for (int r = 0; r < row_limit; ++r) {
-            const int used = usedPagesForRow(sequence_lengths, r, live_bs, page_size, cols);
             if (r >= live_bs) {
-                p[r * cols + 0] = dummy_block;
+                for (int c = 0; c < cols; ++c) {
+                    p[r * cols + c] = dummy_block;
+                }
+                continue;
             }
+            const int used = usedPagesForRow(sequence_lengths, r, live_bs, page_size, cols);
             for (int c = used; c < cols; ++c) {
                 p[r * cols + c] = dummy_block;
             }
@@ -411,23 +414,26 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
 
     // Reset unused batch portions to prevent stale data.
     // Decode graphs are captured at the padded key (e.g. bs=51 replays the 64 graph).
-    // Leftover slots keep capture-time sequence_lengths (~max_seq_len) and block_id=0,
-    // which makes dummy sequences attend the full window on physical block 0.
+    // Dummy *pages* used to stay at block_id=0 (reserved) → IMA. Point them at a
+    // live page below. Dummy *sequence_lengths* must keep the capture dummy_seq
+    // so FlashInfer last_page_len matches plan(); rewriting them to 1 makes FA2
+    // walk a different kv_len than the frozen CUDA-graph tile schedule.
     if (!is_prefill_cuda_graph_mode_) {
         const int graph_bs = state.current_real_graph_bs;
         if (state.current_batch_size < graph_bs) {
-            py_model_inputs_.attention_inputs.sequence_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
+            // Keep dummy rows at capture dummy_seq (not 1) so last_page_len
+            // matches FlashInfer plan(). Also wipe leftover live lengths from
+            // a previous larger batch.
+            const int dummy_seq =
+                std::max(0, capturePageTableWidth() * kernel_seq_size_per_block_ - num_tokens_per_bs_ - 1);
+            py_model_inputs_.attention_inputs.sequence_lengths.slice(0, state.current_batch_size, graph_bs)
+                .fill_(dummy_seq);
             if (py_model_inputs_.attention_inputs.input_lengths.size(0) >= graph_bs) {
                 py_model_inputs_.attention_inputs.input_lengths.slice(0, state.current_batch_size, graph_bs).fill_(1);
             }
             if (py_model_inputs_.attention_inputs.input_lengths_d.defined()
                 && py_model_inputs_.attention_inputs.input_lengths_d.size(0) >= graph_bs) {
                 py_model_inputs_.attention_inputs.input_lengths_d.slice(0, state.current_batch_size, graph_bs).fill_(1);
-            }
-            if (py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.defined()
-                && py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.size(0) >= graph_bs) {
-                py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.slice(0, state.current_batch_size, graph_bs)
-                    .fill_(1);
             }
         }
         // Capture plan walks max_pages per request. Live unused columns and
@@ -493,43 +499,51 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
             .fill_(last_valid_kv);
     }
 
-    // Optional: some attention impls update kernel params here. GptModelBase
-    // exposes fill_params instead, and many backends bake params in __init__.
-    // A missing method must not throw AttributeError and abort replay.
-    {
-        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs(prepare_cuda_graph)");
-        const char* attn_prep = "none";
-        if (!attn_pyobj.is_none() && py::hasattr(attn_pyobj, "prepare_cuda_graph")) {
-            attn_pyobj.attr("prepare_cuda_graph")(py_model_inputs_.attention_inputs);
-            attn_prep = "prepare_cuda_graph";
-        } else if (py::hasattr(py_instance_, "fill_params") && py::hasattr(py_instance_, "params_dict")) {
-            const int capture_key =
-                is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
-            py::object params_dict = py_instance_.attr("params_dict");
-            if (py::len(params_dict) > 0 && params_dict.contains(py::int_(capture_key))) {
-                py_instance_.attr("fill_params")(py_model_inputs_.attention_inputs.sequence_lengths,
-                                                 py_model_inputs_.attention_inputs.input_lengths,
-                                                 py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
-                                                 state.current_batch_size,
-                                                 capture_key,
-                                                 kernel_seq_size_per_block_);
-                attn_prep = "fill_params";
-            } else {
-                attn_prep = "fill_params_skipped";
-            }
+    if (log_this) {
+        logHostIntStats("sequence_lengths",
+                        py_model_inputs_.attention_inputs.sequence_lengths,
+                        state.current_real_graph_bs);
+        logHostIntStats("input_lengths", py_model_inputs_.attention_inputs.input_lengths, state.current_real_graph_bs);
+        logHostIntStats("kv_block_id_host", py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host, 0);
+    }
+}
+
+void CudaGraphRunner::prepareAttnForReplay(CudaGraphState& state, bool log_this) {
+    RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttnForReplay");
+    const size_t graph_idx =
+        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
+    auto& py_model_inputs_ = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
+    auto  attn_pyobj       = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
+
+    // fill_params H2D and convert_offset_to_block_array allocate / write tensors
+    // created before capture (default caching allocator). Running them on
+    // capture_stream_ puts those allocations into the CUDA-graph mempool and
+    // the second live replay aliases captured FlashInfer activations → IMA.
+    const char* attn_prep = "none";
+    if (!attn_pyobj.is_none() && py::hasattr(attn_pyobj, "prepare_cuda_graph")) {
+        attn_pyobj.attr("prepare_cuda_graph")(py_model_inputs_.attention_inputs);
+        attn_prep = "prepare_cuda_graph";
+    } else if (py::hasattr(py_instance_, "fill_params") && py::hasattr(py_instance_, "params_dict")) {
+        const int capture_key =
+            is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
+        py::object params_dict = py_instance_.attr("params_dict");
+        if (py::len(params_dict) > 0 && params_dict.contains(py::int_(capture_key))) {
+            py_instance_.attr("fill_params")(py_model_inputs_.attention_inputs.sequence_lengths,
+                                             py_model_inputs_.attention_inputs.input_lengths,
+                                             py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
+                                             state.current_batch_size,
+                                             capture_key,
+                                             kernel_seq_size_per_block_);
+            attn_prep = "fill_params";
+        } else {
+            attn_prep = "fill_params_skipped";
         }
-        if (log_this) {
-            RTP_LLM_LOG_INFO("CUDA graph attn prep=%s live_bs=%d graph_key=%d",
-                             attn_prep,
-                             state.current_batch_size,
-                             is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len :
-                                                           state.current_real_graph_bs);
-            logHostIntStats("sequence_lengths", py_model_inputs_.attention_inputs.sequence_lengths, state.current_real_graph_bs);
-            logHostIntStats("input_lengths", py_model_inputs_.attention_inputs.input_lengths, state.current_real_graph_bs);
-            logHostIntStats("kv_block_id_host",
-                            py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host,
-                            0);
-        }
+    }
+    if (log_this) {
+        RTP_LLM_LOG_INFO("CUDA graph attn prep=%s live_bs=%d graph_key=%d",
+                         attn_prep,
+                         state.current_batch_size,
+                         is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs);
     }
 }
 
@@ -585,6 +599,9 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
         RTP_LLM_LOG_INFO("CUDA graph default stream wait on inputs_ready");
     }
     inputs_ready_event_.block(cuda_graph::graphGetCurrentStream());
+    // Default-stream attn metadata update: must not allocate on capture_stream_
+    // (CUDA-graph mempool). Page tables are already visible after inputs_ready.
+    prepareAttnForReplay(state, log_this);
     if (log_this) {
         RTP_LLM_LOG_INFO("CUDA graph replay on default stream");
     }

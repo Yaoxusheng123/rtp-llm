@@ -77,6 +77,9 @@ public:
     void           captureDecodeOneBatchSize(int bs);
     void           capturePrefillOneSeqLen(int seq_len);
     void           prepareInputs(const PyModelInputs& inputs, CudaGraphState& state, bool log_this = false);
+    // FlashInfer fill_params / RoPE offset update. Must run on the default
+    // stream after page-table copies, never on capture_stream_ (graph mempool).
+    void           prepareAttnForReplay(CudaGraphState& state, bool log_this = false);
     bool           canRun(const PyModelInputs& inputs, CudaGraphState& state) override;
     void           replayGraph(int key);
     void           replayDecode(int bs);
